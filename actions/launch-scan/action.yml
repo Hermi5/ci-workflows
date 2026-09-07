@@ -1,0 +1,67 @@
+name: launch-scan
+description: >-
+  Run the vendored launch-check scanner over a repo, apply the repo's budget file
+  and turn the findings into annotations and a job summary.
+
+# ADVISORY BY CONSTRUCTION, and the scanner itself says why: it emits candidates,
+# never verdicts, and every rule ships a false-positive profile. Only a finding a
+# human read and reproduced can be a blocker. So this action's own exit code is 0
+# unless the scan crashed; `fail-on-blocker` exists for the wave-3 ratchet and is
+# off by default.
+
+inputs:
+  path:
+    description: Directory to scan
+    required: false
+    default: "."
+  budget-file:
+    description: >-
+      JSON budget file. `launchCheck.maxBlockers` / `maxShouldFix`, when present,
+      are compared against the counts.
+    required: false
+    default: launch-check.budget.json
+  fail-on-blocker:
+    description: "Fail the step when a blocker-severity candidate is found (wave 3 ratchet)"
+    required: false
+    default: "false"
+  extra-args:
+    description: "Extra flags for the scanner, e.g. --no-network"
+    required: false
+    default: ""
+
+outputs:
+  blockers:
+    description: Number of blocker-severity candidates
+    value: ${{ steps.scan.outputs.blockers }}
+  should-fix:
+    description: Number of should-fix candidates
+    value: ${{ steps.scan.outputs.should-fix }}
+  advisory:
+    description: Number of advisory candidates
+    value: ${{ steps.scan.outputs.advisory }}
+
+runs:
+  using: composite
+  steps:
+    - name: Scan
+      id: scan
+      shell: bash
+      env:
+        SCAN_PATH: ${{ inputs.path }}
+        BUDGET_FILE: ${{ inputs.budget-file }}
+        FAIL_ON_BLOCKER: ${{ inputs.fail-on-blocker }}
+        EXTRA_ARGS: ${{ inputs.extra-args }}
+      run: |
+        set -euo pipefail
+        # shellcheck disable=SC2086
+        node "${{ github.action_path }}/launch-scan.mjs" "$SCAN_PATH" --json $EXTRA_ARGS > launch-scan.json
+        node "${{ github.action_path }}/report.mjs" launch-scan.json
+
+    - name: Upload findings
+      if: always()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: launch-scan-${{ github.run_id }}-${{ github.run_attempt }}
+        path: launch-scan.json
+        retention-days: 14
+        if-no-files-found: ignore

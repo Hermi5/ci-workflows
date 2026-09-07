@@ -1,0 +1,24 @@
+# Fleet register for nightly-fleet.yml. Copy to sites.yaml and fill in.
+#
+# One entry per live production URL. `slug` is the issue key: it must be stable,
+# because the nightly job finds a site's existing issue by a title built from it,
+# and renaming a slug orphans the old issue instead of updating it.
+#
+# `enabled: false` parks a site without deleting the row, so the reason stays
+# visible. Deleting the row loses it.
+
+sites:
+  - slug: obermatt-swiss
+    url: https://obermatt.swiss
+    # worker is documentation only; the nightly job checks the public URL.
+    worker: obermatt-swiss
+
+  - slug: stern-ch
+    url: https://stern.ch
+    worker: stern-ch
+
+  - slug: ruetschi
+    url: https://ruetschi.ch
+    worker: ruetschi
+    # Behind Vercel auth and noindex until launch, so nothing to check yet.
+    enabled: false

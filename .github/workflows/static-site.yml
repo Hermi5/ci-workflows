@@ -1,0 +1,70 @@
+name: static-site
+
+# The PR gate for a Next site with no database.
+#
+# WHY THIS IS A WRAPPER AND NOT A SECOND COPY. The gate matrix for `static-site`
+# and `web-app` is identical column for column; the only difference is that a
+# static site has no DB-touching steps to run, and `web-app.yml` has none on the
+# `pull_request` path either: migrations live in `deploy-production.yml`, which
+# a static site simply never calls. Two 300-line files that start identical drift
+# apart, and then "the gate" means two different things depending on which repo
+# you are in. So this is one delegation, and the difference is expressed where it
+# is real: in what the caller passes and in which release workflow it uses.
+#
+# Cost of the wrapper: the required-status-check names gain a level, e.g.
+# `ci / static-site / fast` rather than `ci / fast`. Set the ruleset from the
+# names the first run actually produces.
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        type: string
+        required: false
+        default: "24"
+      package-manager:
+        type: string
+        required: false
+        default: auto
+      run-e2e:
+        type: boolean
+        required: false
+        default: false
+      run-lhci:
+        type: boolean
+        required: false
+        default: false
+      preview-alias:
+        type: string
+        required: false
+        default: ""
+      site-url:
+        type: string
+        required: false
+        default: ""
+    secrets:
+      CF_ACCESS_CLIENT_ID:
+        required: false
+      CF_ACCESS_CLIENT_SECRET:
+        required: false
+      CLOUDFLARE_API_TOKEN:
+        required: false
+      CLOUDFLARE_ACCOUNT_ID:
+        required: false
+      GITLEAKS_LICENSE:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  gates:
+    uses: Hermi5/ci-workflows/.github/workflows/web-app.yml@v1
+    with:
+      node-version: ${{ inputs.node-version }}
+      package-manager: ${{ inputs.package-manager }}
+      run-e2e: ${{ inputs.run-e2e }}
+      run-lhci: ${{ inputs.run-lhci }}
+      preview-alias: ${{ inputs.preview-alias }}
+      site-url: ${{ inputs.site-url }}
+    secrets: inherit

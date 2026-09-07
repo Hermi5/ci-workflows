@@ -1,0 +1,84 @@
+{
+  // Shared Renovate preset for the fleet. A repo extends it with
+  //
+  //   { "extends": ["github>Hermi5/ci-workflows//renovate/default.json5"] }
+  //
+  // in its own renovate.json5.
+  $schema: "https://docs.renovatebot.com/renovate-schema.json",
+
+  extends: [
+    "config:recommended",
+    // Update the version inside `uses: owner/action@<sha> # v1.2.3` too, which
+    // is the whole point of pinning by SHA: a pinned action that nobody updates
+    // is a frozen action.
+    "helpers:pinGitHubActionDigests",
+  ],
+
+  timezone: "Europe/Zurich",
+  schedule: ["* 6-8 * * 1"],
+  prConcurrentLimit: 3,
+  prHourlyLimit: 2,
+  rangeStrategy: "bump",
+
+  // Renovate's OWN automerge, not platformAutomerge. Renovate waits for the
+  // branch to go green before merging; GitHub's auto-merge needs a *required*
+  // status check to wait for, and no repo in this fleet has a ruleset yet
+  // (Hermi5 is a personal account, and rulesets on private repos need Pro).
+  // With platformAutomerge on and no required check, GitHub merges immediately.
+  platformAutomerge: false,
+
+  // Lockfile refresh, monthly, separate from dependency updates so a red run is
+  // attributable to one of the two.
+  lockFileMaintenance: {
+    enabled: true,
+    schedule: ["* 6-8 1-7 * 1"],
+    automerge: true,
+  },
+
+  vulnerabilityAlerts: {
+    // A security fix does not wait for Monday.
+    schedule: [],
+    labels: ["security"],
+    prPriority: 10,
+    automerge: false,
+  },
+
+  packageRules: [
+    {
+      // One PR a week for everything routine. Seventeen repos x fifteen
+      // dependencies is a review queue nobody reads; one grouped PR per repo is
+      // one thing to look at.
+      matchUpdateTypes: ["minor", "patch", "pin", "digest"],
+      groupName: "weekly",
+      automerge: true,
+    },
+    {
+      matchUpdateTypes: ["major"],
+      automerge: false,
+      dependencyDashboardApproval: true,
+    },
+    {
+      // Next stays inside the major the OpenNext adapter supports. The adapter's
+      // peer floor is `>=15.5.24 <16 || >=16.3.3`; 16.3.4 is the version the
+      // migration proved. A 17 arrives through the dashboard, by hand, with the
+      // adapter checked first.
+      matchPackageNames: ["next", "eslint-config-next"],
+      allowedVersions: ">=16.3.4 <17",
+    },
+    {
+      // The adapter itself moves fast and its minors have carried real fixes.
+      // Caret range, grouped with Next so the two are reviewed together.
+      matchPackageNames: ["@opennextjs/cloudflare", "wrangler"],
+      groupName: "cloudflare adapter",
+      automerge: false,
+    },
+    {
+      // A Playwright bump changes what the browsers do, not just the API. It
+      // never automerges, because a green run on the old browser proves nothing
+      // about the new one.
+      matchPackageNames: ["@playwright/test", "@axe-core/playwright"],
+      groupName: "playwright",
+      automerge: false,
+    },
+  ],
+}

@@ -1,0 +1,174 @@
+name: nightly-fleet
+
+# Runs @hermann/site-checks against every production URL in sites.yaml, once a
+# night. Advisory by construction: production is already live, so a red run is a
+# thing to look at in the morning, not a thing to stop.
+#
+# It reports into ONE issue per site, reopened and commented rather than
+# recreated, and closed automatically when the site goes green. A nightly job
+# that opens a fresh issue per failure produces 200 issues a month and is muted
+# within a week; that is the failure mode this shape exists to avoid.
+#
+# This workflow lives in and runs from `ci-workflows` itself. It is not a
+# `workflow_call`. The fleet view belongs in one place, not in 17 repos.
+
+on:
+  schedule:
+    # 04:17 UTC. Off the hour on purpose: GitHub's scheduler queues heavily at
+    # :00 and a cron there can slip by half an hour.
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+    inputs:
+      site:
+        description: "Run one site by slug instead of the whole fleet"
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: nightly-fleet
+  cancel-in-progress: false
+
+env:
+  # The package is installed from git, not from a registry: site-checks is a
+  # public repo, not a published npm package. Switch this to `@hermann/site-checks`
+  # if it is ever published.
+  SITE_CHECKS_PKG: github:Hermi5/site-checks
+
+jobs:
+  prepare:
+    name: prepare
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.read.outputs.matrix }}
+      count: ${{ steps.read.outputs.count }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # PyYAML is preinstalled on the ubuntu-latest runner image. If that ever
+      # stops being true this step fails loudly rather than emitting an empty
+      # matrix, which would report a green fleet that was never scanned.
+      - name: Read sites.yaml
+        id: read
+        env:
+          ONLY_SITE: ${{ inputs.site }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os, sys
+          try:
+              import yaml
+          except ModuleNotFoundError:
+              print("::error::PyYAML is not available on this runner; sites.yaml cannot be read", file=sys.stderr)
+              raise SystemExit(1)
+
+          with open("sites.yaml") as fh:
+              doc = yaml.safe_load(fh) or {}
+
+          only = os.environ.get("ONLY_SITE", "").strip()
+          sites = []
+          for site in doc.get("sites", []):
+              if not site.get("url") or site.get("enabled") is False:
+                  continue
+              if only and site.get("slug") != only:
+                  continue
+              sites.append({"slug": site["slug"], "url": site["url"].rstrip("/")})
+
+          if not sites:
+              print("::error::sites.yaml produced zero sites to check", file=sys.stderr)
+              raise SystemExit(1)
+
+          print(f"matrix={json.dumps(sites)}")
+          print(f"count={len(sites)}")
+          PY
+
+  check:
+    name: ${{ matrix.site.slug }}
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        site: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      - name: Install site-checks
+        run: |
+          set -euo pipefail
+          npm init -y > /dev/null
+          npm i --no-save "$SITE_CHECKS_PKG" @playwright/test @axe-core/playwright
+          npx playwright install --with-deps chromium
+
+      - name: Run site-checks
+        id: run
+        continue-on-error: true
+        env:
+          SITE_URL: ${{ matrix.site.url }}
+        run: |
+          # pipefail, or `tee` returns 0 for a failing suite, the step outcome
+          # reads as success, and the issue never opens.
+          set -o pipefail
+          npx site-checks "$SITE_URL" 2>&1 | tee site-checks.log
+
+      - name: Open, update or close the site's issue
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          SLUG: ${{ matrix.site.slug }}
+          SITE_URL: ${{ matrix.site.url }}
+          OUTCOME: ${{ steps.run.outcome }}
+        with:
+          script: |
+            const fs = require('node:fs');
+            const { SLUG, SITE_URL, OUTCOME } = process.env;
+            const title = `Nightly site-checks failing: ${SLUG}`;
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+            // One issue per site, found by exact title. Search rather than a
+            // stored id: an issue closed by hand must not orphan the tracker.
+            const { data: open } = await github.rest.issues.listForRepo({
+              ...context.repo, state: 'open', labels: 'nightly-fleet', per_page: 100,
+            });
+            const existing = open.find((i) => i.title === title);
+
+            if (OUTCOME === 'success') {
+              if (existing) {
+                await github.rest.issues.createComment({
+                  ...context.repo, issue_number: existing.number,
+                  body: `Green again on ${new Date().toISOString().slice(0, 10)}. [Run](${runUrl})`,
+                });
+                await github.rest.issues.update({ ...context.repo, issue_number: existing.number, state: 'closed' });
+              }
+              return;
+            }
+
+            let log = '';
+            try { log = fs.readFileSync('site-checks.log', 'utf8').slice(-6000); } catch {}
+            const body = [
+              `\`${SITE_URL}\` failed site-checks on ${new Date().toISOString().slice(0, 10)}.`,
+              '',
+              `[Run](${runUrl})`,
+              '',
+              '<details><summary>Output (tail)</summary>',
+              '',
+              '```',
+              log || '(no output captured)',
+              '```',
+              '',
+              '</details>',
+            ].join('\n');
+
+            if (existing) {
+              await github.rest.issues.createComment({ ...context.repo, issue_number: existing.number, body });
+            } else {
+              await github.rest.issues.create({ ...context.repo, title, body, labels: ['nightly-fleet'] });
+            }

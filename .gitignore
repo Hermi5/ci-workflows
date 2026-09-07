@@ -1,0 +1,5 @@
+# Nothing in this repo is built. These are only ever local scratch.
+node_modules
+launch-scan.json
+sites.yaml
+.DS_Store

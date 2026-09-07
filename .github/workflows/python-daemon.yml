@@ -1,0 +1,137 @@
+name: python-daemon
+
+# The PR gate for the six Python daemons (domain-sentinel, feed-sentinel,
+# sam-sentinel, kubera-sync, time-ledger and the next one).
+#
+# Same shape as web-app.yml and the same ratchet rule, minus everything that
+# needs a browser or a URL. `mypy` is advisory on arrival because none of these
+# repos was written against it; it flips to blocking after two green weeks, which
+# is the moment to delete `continue-on-error`, not the moment to add ignores.
+
+on:
+  workflow_call:
+    inputs:
+      python-version:
+        description: "Python version for uv to provision"
+        type: string
+        required: false
+        default: "3.13"
+      package-dir:
+        description: "Directory mypy and ruff should scan"
+        type: string
+        required: false
+        default: src
+    secrets:
+      GITLEAKS_LICENSE:
+        description: Organisation licence for gitleaks-action. Personal repos need none.
+        required: false
+
+concurrency:
+  group: python-daemon-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  fast:
+    name: fast
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # Full history: gitleaks scans commits, not the diff.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          python-version: ${{ inputs.python-version }}
+          enable-cache: true
+
+      # `--frozen` is the uv equivalent of `npm ci`: it refuses to re-resolve, so
+      # a lockfile that has drifted from pyproject.toml fails here rather than
+      # producing a build nobody can reproduce.
+      - name: Install
+        run: uv sync --frozen --all-extras --dev
+
+      - name: ruff check
+        if: always()
+        run: uv run ruff check .
+
+      - name: ruff format
+        if: always()
+        run: uv run ruff format --check .
+
+      # Gate matrix: advisory. Delete `continue-on-error` after two green weeks.
+      - name: mypy
+        if: always()
+        continue-on-error: true
+        env:
+          PACKAGE_DIR: ${{ inputs.package-dir }}
+        run: uv run mypy "$PACKAGE_DIR"
+
+      - name: pytest
+        if: always()
+        run: |
+          set -o pipefail
+          uv run pytest -q 2>&1 | tee pytest.log
+          if grep -qE 'no tests ran|collected 0 items' pytest.log; then
+            echo "::warning::pytest collected zero tests. Green here means nothing was checked."
+          fi
+
+      - name: gitleaks
+        if: always()
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+
+  audit:
+    name: audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: osv-scanner
+        continue-on-error: true
+        uses: google/osv-scanner-action/osv-scanner-action@6e4298ebc4db23e847df9b2e2de2939d6f066c67 # v2.5.1
+        with:
+          scan-args: |-
+            --format=json
+            --output=osv.json
+            --recursive
+            ./
+
+      # CVSS v3 calls 9.0 and above CRITICAL. The scanner's exit code cannot tell
+      # a critical from a low, so the verdict is computed from the report.
+      - name: Block on CRITICAL
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          if not os.path.exists("osv.json"):
+              print("::warning::osv-scanner produced no report")
+              sys.exit(0)
+          with open("osv.json") as fh:
+              report = json.load(fh)
+          critical = []
+          count = 0
+          for result in report.get("results", []):
+              for pkg in result.get("packages", []):
+                  count += 1
+                  for group in pkg.get("groups", []):
+                      try:
+                          score = float(group.get("max_severity", ""))
+                      except ValueError:
+                          continue
+                      if score >= 9.0:
+                          name = pkg.get("package", {}).get("name", "?")
+                          version = pkg.get("package", {}).get("version", "?")
+                          critical.append(f"{name}@{version} {','.join(group.get('ids', []))} CVSS {score}")
+          print(f"osv-scanner: {count} vulnerable package entr(ies), {len(critical)} CRITICAL")
+          for line in critical:
+              print(f"::error::CRITICAL {line}")
+          sys.exit(1 if critical else 0)
+          PY

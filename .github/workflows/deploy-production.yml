@@ -1,0 +1,200 @@
+name: deploy-production
+
+# Production release. The caller triggers this on a `v*` tag and nothing else.
+#
+# WHY ACTIONS OWNS PRODUCTION WHILE WORKERS BUILDS OWNS STAGING. Workers Builds
+# has no approval gate, no ordering guarantee against `drizzle-kit migrate`, and
+# nowhere to put a smoke test between upload and promote. All three exist here:
+# `environment: production` holds the required reviewer, and the job is one
+# serialized sequence: snapshot, migrate, upload without traffic, smoke, promote.
+#
+# WHAT THIS COSTS. Production is a *rebuild of the tagged commit*, not a
+# byte-identical promotion of the staging binary. Mitigated by the lockfile, the
+# pinned Node major and the same build image; the fallback is `wrangler rollback`
+# (100 versions retained).
+#
+# EXPAND/CONTRACT IS MANDATORY, not a preference. `wrangler rollback` does not
+# revert bindings or the database, so a rollback across a destructive migration
+# leaves the old code pointed at the new schema. Every migration must work
+# against both the old and the new code.
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        type: string
+        required: false
+        default: "24"
+      package-manager:
+        type: string
+        required: false
+        default: auto
+      has-db:
+        description: "Take a pg_dump snapshot and run drizzle-kit migrate before deploying"
+        type: boolean
+        required: false
+        default: false
+      environment:
+        description: "GitHub environment holding the reviewer and the production secrets"
+        type: string
+        required: false
+        default: production
+      smoke-path:
+        description: "Path fetched on the version preview URL before promoting"
+        type: string
+        required: false
+        default: /
+      smoke-marker:
+        description: >-
+          String that must appear in the smoke response body. Empty checks the
+          status only, which is a weaker gate: a 200 error page passes it.
+        type: string
+        required: false
+        default: ""
+    secrets:
+      CLOUDFLARE_API_TOKEN:
+        required: true
+      CLOUDFLARE_ACCOUNT_ID:
+        required: true
+      DATABASE_URL_PRODUCTION:
+        description: Only needed when has-db is true
+        required: false
+
+permissions:
+  contents: read
+
+# Never cancel a release in flight. Cancelling between `versions upload` and
+# `versions deploy` leaves an uploaded version that carries no traffic and a
+# migration that has already run.
+concurrency:
+  group: deploy-production-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: release
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    timeout-minutes: 45
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      WRANGLER_SEND_METRICS: "false"
+    steps:
+      # The tag, not the branch head. `github.ref` on a tag push is the tag.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.ref }}
+
+      - uses: Hermi5/ci-workflows/actions/setup-runtime@v1
+        with:
+          node-version: ${{ inputs.node-version }}
+          package-manager: ${{ inputs.package-manager }}
+
+      # `opennextjs-cloudflare build` runs `next build` and then bundles
+      # `.open-next/worker.js`, which is what `wrangler versions upload` uploads.
+      # A bare `next build` would leave nothing to upload.
+      - name: Build
+        run: npx --no-install opennextjs-cloudflare build
+
+      # A snapshot before a migration, kept for 30 days. `pg_dump` is on the
+      # runner image; `--no-owner --no-acl` so the dump restores into a fresh
+      # database without the production roles existing.
+      - name: Snapshot the production database
+        if: inputs.has-db
+        env:
+          DATABASE_URL_PRODUCTION: ${{ secrets.DATABASE_URL_PRODUCTION }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DATABASE_URL_PRODUCTION:-}" ]; then
+            echo "::error::has-db is true but DATABASE_URL_PRODUCTION is not set"
+            exit 1
+          fi
+          pg_dump --no-owner --no-acl --format=custom \
+            --file="snapshot-${GITHUB_REF_NAME}.dump" "$DATABASE_URL_PRODUCTION"
+          ls -lh "snapshot-${GITHUB_REF_NAME}.dump"
+
+      - name: Upload the snapshot
+        if: inputs.has-db
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: db-snapshot-${{ github.ref_name }}
+          path: snapshot-*.dump
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Migrate
+        if: inputs.has-db
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL_PRODUCTION }}
+        run: npx --no-install drizzle-kit migrate
+
+      # Upload without promoting. The new version exists and is reachable on its
+      # own preview URL; live traffic still goes to the previous one.
+      - name: Upload the version
+        id: upload
+        uses: cloudflare/wrangler-action@ebbaa1584979971c8614a24965b4405ff95890e0 # v4.0.0
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: versions upload --tag ${{ github.ref_name }} --message "release ${{ github.ref_name }}"
+
+      # The whole reason production is not Workers Builds: something runs between
+      # upload and promote. A version that 500s never carries traffic.
+      - name: Smoke the version preview
+        id: smoke
+        env:
+          COMMAND_OUTPUT: ${{ steps.upload.outputs.command-output }}
+          SMOKE_PATH: ${{ inputs.smoke-path }}
+          SMOKE_MARKER: ${{ inputs.smoke-marker }}
+        run: |
+          set -euo pipefail
+          version_id="$(printf '%s' "$COMMAND_OUTPUT" | sed -n 's/.*Worker Version ID:[[:space:]]*\([0-9a-f-]\{36\}\).*/\1/p' | head -1)"
+          preview="$(printf '%s' "$COMMAND_OUTPUT" | grep -oE 'https://[a-z0-9-]+\.[a-z0-9-]+\.workers\.dev' | head -1)"
+
+          if [ -z "$version_id" ]; then
+            echo "::error::no Worker Version ID in the wrangler output; refusing to promote"
+            exit 1
+          fi
+          echo "version-id=$version_id" >> "$GITHUB_OUTPUT"
+
+          if [ -z "$preview" ]; then
+            echo "::error::no version preview URL in the wrangler output; refusing to promote an unsmoked version"
+            exit 1
+          fi
+
+          body="$(mktemp)"
+          code="$(curl -sS -o "$body" -w '%{http_code}' --max-time 30 "${preview}${SMOKE_PATH}")"
+          echo "smoke: $preview$SMOKE_PATH -> HTTP $code"
+          [ "$code" = "200" ] || { echo "::error::smoke test returned HTTP $code"; exit 1; }
+
+          if [ -n "$SMOKE_MARKER" ]; then
+            grep -qF -- "$SMOKE_MARKER" "$body" || {
+              echo "::error::smoke marker not found in the response body"
+              exit 1
+            }
+            echo "smoke marker found"
+          else
+            echo "::warning::no smoke-marker configured; only the status code was checked, and a 200 error page passes that"
+          fi
+
+      - name: Promote to 100%
+        uses: cloudflare/wrangler-action@ebbaa1584979971c8614a24965b4405ff95890e0 # v4.0.0
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: versions deploy ${{ steps.smoke.outputs.version-id }}@100% --yes
+
+      - name: Record what shipped
+        if: always()
+        env:
+          VERSION_ID: ${{ steps.smoke.outputs.version-id }}
+        run: |
+          {
+            echo "## Release ${GITHUB_REF_NAME}"
+            echo ""
+            echo "- commit \`${GITHUB_SHA}\`"
+            echo "- worker version \`${VERSION_ID:-none}\`"
+            echo "- rollback: \`wrangler rollback\`, or \`wrangler versions deploy <previous-id>@100%\`"
+            echo "- bindings and the database are NOT reverted by a rollback; that is why migrations are expand/contract"
+          } >> "$GITHUB_STEP_SUMMARY"

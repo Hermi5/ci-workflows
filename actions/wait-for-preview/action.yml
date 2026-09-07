@@ -1,0 +1,138 @@
+name: Wait for preview
+description: >-
+  Derive the Cloudflare Workers preview URL for this branch and poll it until it
+  answers 200, sending the Access service-token headers.
+
+# WHY THIS EXISTS. Workers Builds and GitHub Actions start at the same moment and
+# are not ordered against each other. The gates that need a real URL (e2e,
+# site-checks, LHCI) would otherwise race the build. There is no webhook to wait
+# on, so the URL is *computed* rather than received: `wrangler versions upload
+# --preview-alias <alias>` produces a deterministic host,
+#
+#     https://<alias>-<worker-name>.<subdomain>.workers.dev
+#
+# documented at https://developers.cloudflare.com/workers/configuration/previews/
+#
+# The alias is a branch name run through Cloudflare's own sanitizer. Same page:
+# the alias is lowercased, every character outside [a-z0-9-] becomes a hyphen,
+# leading and trailing hyphens are trimmed, and the result is truncated to 63
+# characters (the DNS label ceiling). Reproducing that rule here is the whole
+# reason this action can guess the URL at all; get it wrong and the poll times
+# out on a branch with a slash or an umlaut in it.
+#
+# KNOWN GAP, measured 2026-09-07: a non-ASCII character is multi-byte UTF-8 and
+# becomes one hyphen per byte here, so `Ümlaut-Branch` sanitizes to
+# `hermann--mlaut-branch`. Whether Cloudflare collapses runs of hyphens is
+# UNVERIFIED. ASCII branch names are unaffected; for anything else pass
+# `site-url` and skip the guess entirely.
+#
+# Preview URLs are protected by Cloudflare Access, so every poll and every gate
+# carries a service token
+# (https://developers.cloudflare.com/cloudflare-one/identity/service-tokens/).
+# Without a Service Auth policy on the Worker the poll gets a login page, which
+# is a 200 with the wrong body, so the poll also refuses an Access-branded body.
+
+inputs:
+  alias:
+    description: >-
+      Preview alias. Empty means derive it from the head branch with Cloudflare's
+      sanitizer.
+    required: false
+    default: ""
+  worker-name:
+    description: "Worker name that carries the preview, e.g. obermatt-swiss-staging"
+    required: true
+  subdomain:
+    description: "workers.dev subdomain"
+    required: false
+    default: hermannstern
+  access-client-id:
+    description: Cloudflare Access service token client id
+    required: false
+    default: ""
+  access-client-secret:
+    description: Cloudflare Access service token client secret
+    required: false
+    default: ""
+  timeout-minutes:
+    description: How long to poll before giving up
+    required: false
+    default: "15"
+
+outputs:
+  url:
+    description: The preview URL that answered 200
+    value: ${{ steps.poll.outputs.url }}
+  alias:
+    description: The sanitized alias the URL was built from
+    value: ${{ steps.poll.outputs.alias }}
+
+runs:
+  using: composite
+  steps:
+    - name: Poll the preview
+      id: poll
+      shell: bash
+      env:
+        CF_ACCESS_CLIENT_ID: ${{ inputs.access-client-id }}
+        CF_ACCESS_CLIENT_SECRET: ${{ inputs.access-client-secret }}
+        # Branch names are attacker-controlled on a fork PR, so they never reach
+        # the shell through `${{ }}` interpolation. Same for every other input.
+        INPUT_ALIAS: ${{ inputs.alias }}
+        HEAD_REF: ${{ github.head_ref || github.ref_name }}
+        WORKER_NAME: ${{ inputs.worker-name }}
+        SUBDOMAIN: ${{ inputs.subdomain }}
+        TIMEOUT_MINUTES: ${{ inputs.timeout-minutes }}
+      run: |
+        set -euo pipefail
+
+        raw="$INPUT_ALIAS"
+        [ -n "$raw" ] || raw="$HEAD_REF"
+
+        # Cloudflare's alias sanitizer, reproduced. See the header comment.
+        alias="$(printf '%s' "$raw" \
+          | tr '[:upper:]' '[:lower:]' \
+          | sed -e 's/[^a-z0-9-]/-/g' -e 's/^-*//' -e 's/-*$//' \
+          | cut -c1-63 \
+          | sed -e 's/-*$//')"
+
+        if [ -z "$alias" ]; then
+          echo "::error::branch \"$raw\" sanitizes to an empty alias"
+          exit 1
+        fi
+
+        url="https://${alias}-${WORKER_NAME}.${SUBDOMAIN}.workers.dev"
+        echo "alias=$alias" >> "$GITHUB_OUTPUT"
+        echo "url=$url" >> "$GITHUB_OUTPUT"
+        echo "Preview: $url"
+
+        deadline=$(( $(date +%s) + TIMEOUT_MINUTES * 60 ))
+        attempt=0
+        while [ "$(date +%s)" -lt "$deadline" ]; do
+          attempt=$((attempt + 1))
+          body="$(mktemp)"
+          code="$(curl -sS -o "$body" -w '%{http_code}' \
+            -H "CF-Access-Client-Id: ${CF_ACCESS_CLIENT_ID}" \
+            -H "CF-Access-Client-Secret: ${CF_ACCESS_CLIENT_SECRET}" \
+            --max-time 20 "$url/" || true)"
+
+          if [ "$code" = "200" ]; then
+            # A 200 carrying the Access login shell means the service token was
+            # not accepted. Treating it as ready would run every gate against a
+            # sign-in page and report it green.
+            if grep -qiE 'cloudflare access|cf-access-|sign in to continue' "$body"; then
+              echo "attempt $attempt: 200 but the body is the Access login page"
+            else
+              echo "Ready after $attempt attempt(s)."
+              rm -f "$body"
+              exit 0
+            fi
+          else
+            echo "attempt $attempt: HTTP $code"
+          fi
+          rm -f "$body"
+          sleep 15
+        done
+
+        echo "::error::preview $url did not answer 200 within ${TIMEOUT_MINUTES} minutes"
+        exit 1

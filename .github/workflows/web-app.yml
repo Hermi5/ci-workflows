@@ -1,0 +1,380 @@
+name: web-app
+
+# The fleet's PR gate for a Next app on Cloudflare Workers.
+#
+# TRIGGER. `workflow_call` only. The caller wires it to `pull_request` and to
+# nothing else. Never `push: main`, because Workers Builds already deploys staging on
+# every merge, so a second heavy run there buys nothing and the minute budget is
+# tight: ~13 min per PR run x 17 sites x ~8 pushes/month is already ~1,770 of
+# 2,000 free minutes.
+#
+# SHAPE. Four jobs, and the split is the point.
+#   fast          - everything that needs no URL. Cheapest first, but every step
+#                   runs even after a failure (`if: always()`), because "lint
+#                   failed" tells you nothing about the tests and a second push
+#                   to find out costs more than the runner minutes.
+#   scan          - launch-check, advisory, parallel with fast.
+#   preview-gates - everything that needs a deployed URL, so it waits for the
+#                   Workers Builds preview rather than building a second time.
+#   audit         - osv-scanner, advisory except on CRITICAL.
+#
+# RATCHET. Gates arrive advisory and flip to blocking after two consecutive green
+# weeks on a repo. Advisory steps are marked `continue-on-error: true` with the
+# gate matrix column in a comment. Removing that line is the ratchet.
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: "Node major. Empty reads .nvmrc, then mise.toml, then 24."
+        type: string
+        required: false
+        default: "24"
+      package-manager:
+        description: "npm | pnpm | auto (detect from the lockfile)"
+        type: string
+        required: false
+        default: auto
+      run-e2e:
+        description: "Run the caller's Playwright `e2e` project against the preview"
+        type: boolean
+        required: false
+        default: false
+      run-lhci:
+        description: "Run Lighthouse CI against the preview using the caller's lighthouserc.json"
+        type: boolean
+        required: false
+        default: false
+      preview-alias:
+        description: >-
+          Preview alias. Empty derives it from the head branch with Cloudflare's
+          own sanitizer.
+        type: string
+        required: false
+        default: ""
+      site-url:
+        description: >-
+          Skip the preview wait and gate this URL instead. The escape hatch for a
+          repo whose Worker is not named `<repo>-staging`.
+        type: string
+        required: false
+        default: ""
+    secrets:
+      CF_ACCESS_CLIENT_ID:
+        description: Cloudflare Access service token id for the preview
+        required: false
+      CF_ACCESS_CLIENT_SECRET:
+        description: Cloudflare Access service token secret for the preview
+        required: false
+      CLOUDFLARE_API_TOKEN:
+        description: Needed only by the wrangler dry-run size check
+        required: false
+      CLOUDFLARE_ACCOUNT_ID:
+        description: Needed only by the wrangler dry-run size check
+        required: false
+      GITLEAKS_LICENSE:
+        description: Organisation licence for gitleaks-action. Personal repos need none.
+        required: false
+
+# A second push to the same PR cancels the first. Nothing in here has side
+# effects, so an in-flight run of superseded code is pure waste.
+concurrency:
+  group: web-app-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  fast:
+    name: fast
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # fetch-depth 0 because gitleaks scans history, not the diff. A secret that
+      # was committed and then removed is still a leaked secret.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: Hermi5/ci-workflows/actions/setup-runtime@v1 # keep in step with the tag the caller uses
+        with:
+          node-version: ${{ inputs.node-version }}
+          package-manager: ${{ inputs.package-manager }}
+
+      # `--no-install` throughout: every tool comes from the repo's own lockfile.
+      # Plain `npx` would silently fetch a different version from the registry and
+      # the gate would stop describing the code under review.
+      - name: ESLint
+        if: always()
+        run: npx --no-install eslint .
+
+      # `biome format` is check-mode by default in Biome 2.x; `--write` is what
+      # applies fixes, and `--check` is not a flag it accepts.
+      - name: Biome format
+        if: always()
+        run: npx --no-install biome format .
+
+      - name: Typecheck
+        if: always()
+        run: npx --no-install tsc --noEmit
+
+      # `--passWithNoTests` is not a pass, it is a gap, and it says so out loud.
+      # 17 repos arrived with zero tests; failing them would have got this
+      # workflow deleted in a week, and staying silent would have made "green"
+      # mean nothing.
+      - name: Tests
+        if: always()
+        run: |
+          set -o pipefail
+          npx --no-install vitest run --passWithNoTests 2>&1 | tee vitest.log
+          if grep -qi 'no test files found' vitest.log; then
+            echo "::warning::vitest found zero test files. --passWithNoTests kept this step green; that is a coverage gap, not a pass."
+          fi
+
+      - name: Build
+        if: always()
+        run: npx --no-install next build
+
+      - name: gitleaks
+        if: always()
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+
+  scan:
+    name: scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: Hermi5/ci-workflows/actions/setup-runtime@v1
+        with:
+          node-version: ${{ inputs.node-version }}
+          package-manager: ${{ inputs.package-manager }}
+
+      # Gate matrix: advisory in wave 1, blocking from wave 3. Flip by setting
+      # fail-on-blocker: true, not by deleting the step.
+      - name: launch-check
+        continue-on-error: true
+        uses: Hermi5/ci-workflows/actions/launch-scan@v1
+        with:
+          path: .
+          budget-file: launch-check.budget.json
+          fail-on-blocker: "false"
+
+  preview-gates:
+    name: preview-gates
+    needs: fast
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: Hermi5/ci-workflows/actions/setup-runtime@v1
+        with:
+          node-version: ${{ inputs.node-version }}
+          package-manager: ${{ inputs.package-manager }}
+
+      # The Worker that carries PR previews is `<repo>-staging` by fleet
+      # convention (wrangler environments name themselves `<top-level>-<env>`).
+      # A repo that breaks the convention passes `site-url` instead.
+      - name: Wait for the preview
+        id: preview
+        if: inputs.site-url == ''
+        uses: Hermi5/ci-workflows/actions/wait-for-preview@v1
+        with:
+          alias: ${{ inputs.preview-alias }}
+          worker-name: ${{ github.event.repository.name }}-staging
+          subdomain: hermannstern
+          access-client-id: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          access-client-secret: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+
+      # The preview URL is built from a branch name, which is attacker-controlled
+      # on a fork PR. It reaches the shell through `env:`, never through `${{ }}`
+      # interpolation, so a branch called `$(curl evil)` stays a string.
+      - name: Resolve the URL under test
+        id: url
+        env:
+          SITE_URL_INPUT: ${{ inputs.site-url }}
+          PREVIEW_URL: ${{ steps.preview.outputs.url }}
+        run: |
+          set -euo pipefail
+          url="$SITE_URL_INPUT"
+          [ -n "$url" ] || url="$PREVIEW_URL"
+          if [ -z "$url" ]; then
+            echo "::error::no site-url input and no preview URL"
+            exit 1
+          fi
+          echo "url=${url%/}" >> "$GITHUB_OUTPUT"
+          echo "Gating $url"
+
+      # axe rides in here. `@axe-core/playwright` belongs to the caller's own
+      # `e2e` project, so serious+critical violations fail with the rest of the
+      # suite instead of needing a separate runner pass.
+      - name: Playwright e2e
+        if: inputs.run-e2e
+        env:
+          SITE_URL: ${{ steps.url.outputs.url }}
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+          npx --no-install playwright install --with-deps chromium
+          npx --no-install playwright test --project=e2e
+
+      # Gate matrix: advisory, blocking after one green week on the repo.
+      - name: site-checks
+        if: always() && inputs.run-e2e
+        continue-on-error: true
+        env:
+          SITE_URL: ${{ steps.url.outputs.url }}
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+        run: npx --no-install playwright test --project=site-checks
+
+      # `@lhci/cli` rather than an action: it is the fleet's proven path
+      # (StellaVie ran it this way from 2026-08) and it needs no third-party SHA.
+      # The blocking/warning split lives entirely in the caller's
+      # lighthouserc.json: SEO and CLS error, performance warns.
+      - name: Lighthouse CI
+        if: always() && inputs.run-lhci
+        env:
+          URL: ${{ steps.url.outputs.url }}
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+          # A cold Worker serves the first request slowly enough that Lighthouse
+          # attributes it to the page. Warm it once and discard the timing.
+          curl -sS -o /dev/null -w 'warmup: HTTP %{http_code} in %{time_total}s\n' \
+            -H "CF-Access-Client-Id: ${CF_ACCESS_CLIENT_ID}" \
+            -H "CF-Access-Client-Secret: ${CF_ACCESS_CLIENT_SECRET}" \
+            "$URL/"
+          npx --yes @lhci/cli@0.15.x autorun \
+            --collect.url="$URL/" \
+            --collect.chromeFlags="--no-sandbox --headless=new"
+
+      # Gate matrix: advisory. A sample, not a crawl: 30 URLs off the served
+      # sitemap, which is the same "derive, never list" rule the metadata gate
+      # uses, because two hand-maintained route lists drift apart.
+      - name: Link check (sitemap sample)
+        if: always()
+        continue-on-error: true
+        env:
+          URL: ${{ steps.url.outputs.url }}
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+        run: |
+          node --input-type=module -e '
+            const base = process.env.URL.replace(/\/$/, "");
+            const headers = {
+              "CF-Access-Client-Id": process.env.CF_ACCESS_CLIENT_ID ?? "",
+              "CF-Access-Client-Secret": process.env.CF_ACCESS_CLIENT_SECRET ?? "",
+            };
+            const sm = await fetch(`${base}/sitemap.xml`, { headers });
+            if (!sm.ok) {
+              console.log(`::warning::${base}/sitemap.xml returned HTTP ${sm.status}; link check skipped`);
+              process.exit(0);
+            }
+            const paths = [...(await sm.text()).matchAll(/<loc>([^<]+)<\/loc>/g)]
+              .map((m) => new URL(m[1]).pathname);
+            const step = Math.max(1, Math.floor(paths.length / 30));
+            const sample = paths.filter((_, i) => i % step === 0).slice(0, 30);
+            let bad = 0;
+            for (const p of sample) {
+              const res = await fetch(base + p, { headers, redirect: "follow" });
+              if (!res.ok) { bad++; console.log(`::warning::${p} -> HTTP ${res.status}`); }
+            }
+            console.log(`link check: ${sample.length} of ${paths.length} sitemap URLs sampled, ${bad} bad`);
+            process.exit(bad ? 1 : 0);
+          '
+
+      # Gate matrix: advisory, blocking at 90% of the 3 MB Worker ceiling. The
+      # dry run is local, it needs no deploy and no traffic, but wrangler still
+      # wants an account when the config carries bindings.
+      - name: Worker size budget
+        if: always()
+        continue-on-error: true
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          WRANGLER_SEND_METRICS: "false"
+        run: |
+          set -euo pipefail
+          npx --no-install opennextjs-cloudflare build
+          npx --no-install wrangler deploy --dry-run --outdir=.wrangler-dry 2>&1 | tee wrangler-dry.log
+          node --input-type=module -e '
+            import fs from "node:fs";
+            const log = fs.readFileSync("wrangler-dry.log", "utf8");
+            const m = log.match(/Total Upload:\s*([\d.]+)\s*(\w+)\s*\/\s*gzip:\s*([\d.]+)\s*(\w+)/i);
+            if (!m) { console.log("::warning::no Total Upload line in the wrangler dry run"); process.exit(0); }
+            const toKiB = (n, unit) => (/^mib$/i.test(unit) ? Number(n) * 1024 : Number(n));
+            const gzipKiB = toKiB(m[3], m[4]);
+            let budget = null;
+            if (fs.existsSync("launch-check.budget.json"))
+              budget = JSON.parse(fs.readFileSync("launch-check.budget.json", "utf8")).worker ?? null;
+            console.log(`Total Upload gzip: ${gzipKiB.toFixed(1)} KiB`);
+            if (!budget?.maxGzipKiB) process.exit(0);
+            const pct = (gzipKiB / budget.maxGzipKiB) * 100;
+            console.log(`${pct.toFixed(0)}% of the ${budget.maxGzipKiB} KiB budget`);
+            if (pct >= 90) { console.log(`::error::Worker bundle is at ${pct.toFixed(0)}% of budget`); process.exit(1); }
+            if (pct >= 75) console.log(`::warning::Worker bundle is at ${pct.toFixed(0)}% of budget`);
+          '
+
+      - name: Upload Playwright and Lighthouse reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: preview-gates-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            playwright-report/
+            test-results/
+            .lighthouseci/
+          retention-days: 14
+          if-no-files-found: ignore
+
+  audit:
+    name: audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Advisory: the scanner's own exit code is ignored. Only CRITICAL blocks,
+      # and that verdict is computed below from the JSON rather than from the
+      # exit code, which cannot tell a critical from a low.
+      - name: osv-scanner
+        continue-on-error: true
+        uses: google/osv-scanner-action/osv-scanner-action@6e4298ebc4db23e847df9b2e2de2939d6f066c67 # v2.5.1
+        with:
+          scan-args: |-
+            --format=json
+            --output=osv.json
+            --recursive
+            ./
+
+      # OSV records carry CVSS; osv-scanner reports the worst score per group as
+      # `max_severity`. CVSS v3 calls 9.0 and above CRITICAL, so that is the line.
+      - name: Block on CRITICAL
+        if: always()
+        run: |
+          node --input-type=module -e '
+            import fs from "node:fs";
+            if (!fs.existsSync("osv.json")) { console.log("::warning::osv-scanner produced no report"); process.exit(0); }
+            const report = JSON.parse(fs.readFileSync("osv.json", "utf8"));
+            const critical = [];
+            for (const r of report.results ?? [])
+              for (const p of r.packages ?? [])
+                for (const g of p.groups ?? []) {
+                  const score = Number.parseFloat(g.max_severity ?? "");
+                  if (Number.isFinite(score) && score >= 9.0)
+                    critical.push(`${p.package?.name ?? "?"}@${p.package?.version ?? "?"} ${g.ids?.join(",") ?? ""} CVSS ${score}`);
+                }
+            const total = (report.results ?? []).flatMap((r) => r.packages ?? []).length;
+            console.log(`osv-scanner: ${total} vulnerable package entr(ies), ${critical.length} CRITICAL`);
+            for (const c of critical) console.log(`::error::CRITICAL ${c}`);
+            process.exit(critical.length ? 1 : 0);
+          '

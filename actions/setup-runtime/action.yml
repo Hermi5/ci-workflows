@@ -1,0 +1,103 @@
+name: Setup runtime
+description: >-
+  Pin Node from the repo's own files, pick the package manager from the lockfile,
+  restore the dependency cache and install lockfile-exact.
+
+# One place decides what Node a repo builds on, and it is the repo, not the
+# workflow. `.nvmrc` is the file Cloudflare Workers Builds reads
+# (developers.cloudflare.com/workers/ci-cd/builds/build-image/), so CI reading the
+# same file is what keeps a green PR and a green Workers build from disagreeing
+# about the runtime. `mise.toml` is the local-shell half of the same number.
+
+inputs:
+  node-version:
+    description: >-
+      Explicit Node major. Empty means read .nvmrc, then mise.toml, then fall
+      back to 24 (the Workers Builds default image).
+    required: false
+    default: ""
+  package-manager:
+    description: "npm | pnpm | auto (detect from the lockfile)"
+    required: false
+    default: auto
+  install:
+    description: "Run the lockfile-exact install. false leaves the tree untouched."
+    required: false
+    default: "true"
+
+outputs:
+  node-version:
+    description: The Node major that was installed
+    value: ${{ steps.resolve.outputs.node-version }}
+  package-manager:
+    description: The package manager that was used
+    value: ${{ steps.resolve.outputs.package-manager }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve runtime and package manager
+      id: resolve
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        node_version="${{ inputs.node-version }}"
+        if [ -z "$node_version" ] && [ -f .nvmrc ]; then
+          node_version="$(tr -d ' \tv\r\n' < .nvmrc)"
+        fi
+        if [ -z "$node_version" ] && [ -f mise.toml ]; then
+          # [tools] node = "24"  ->  24
+          node_version="$(sed -n 's/^[[:space:]]*node[[:space:]]*=[[:space:]]*"\{0,1\}\([0-9.]*\)"\{0,1\}.*/\1/p' mise.toml | head -1)"
+        fi
+        [ -n "$node_version" ] || node_version=24
+
+        pm="${{ inputs.package-manager }}"
+        if [ "$pm" = "auto" ]; then
+          if [ -f pnpm-lock.yaml ]; then pm=pnpm
+          elif [ -f package-lock.json ]; then pm=npm
+          else
+            echo "::error::no package-lock.json and no pnpm-lock.yaml; a lockfile-exact install is impossible"
+            exit 1
+          fi
+        fi
+
+        echo "node-version=$node_version" >> "$GITHUB_OUTPUT"
+        echo "package-manager=$pm" >> "$GITHUB_OUTPUT"
+        echo "Node $node_version, package manager $pm"
+
+    # pnpm has to exist before setup-node runs, because `cache: pnpm` shells out
+    # to `pnpm store path`. Corepack reads the `packageManager` field, so a pnpm
+    # repo without that field is a configuration error here, not a CI bug.
+    - name: Enable corepack for pnpm
+      if: steps.resolve.outputs.package-manager == 'pnpm'
+      shell: bash
+      run: |
+        set -euo pipefail
+        grep -q '"packageManager"' package.json || {
+          echo "::error::pnpm repo without a \"packageManager\" field in package.json; corepack cannot pick a version"
+          exit 1
+        }
+        corepack enable
+
+    - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      with:
+        node-version: ${{ steps.resolve.outputs.node-version }}
+        cache: ${{ steps.resolve.outputs.package-manager }}
+        cache-dependency-path: |
+          package-lock.json
+          pnpm-lock.yaml
+
+    # `ci` / `--frozen-lockfile`, never `install`: they honour the lockfile
+    # exactly and fail when package.json has drifted from it, which is the one
+    # class of "works on my machine" nothing else in this pipeline guards.
+    - name: Install
+      if: inputs.install == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [ "${{ steps.resolve.outputs.package-manager }}" = "pnpm" ]; then
+          pnpm install --frozen-lockfile
+        else
+          npm ci
+        fi
