@@ -5,8 +5,15 @@ name: deploy-production
 # WHY ACTIONS OWNS PRODUCTION WHILE WORKERS BUILDS OWNS STAGING. Workers Builds
 # has no approval gate, no ordering guarantee against `drizzle-kit migrate`, and
 # nowhere to put a smoke test between upload and promote. All three exist here:
-# `environment: production` holds the required reviewer, and the job is one
-# serialized sequence: snapshot, migrate, upload without traffic, smoke, promote.
+# the job is one serialized sequence: snapshot, migrate, upload without traffic,
+# smoke, promote.
+#
+# WHERE THE APPROVAL ACTUALLY LIVES. `environment: production` holds the
+# production secrets and the tag policy. It does NOT hold a required reviewer on
+# a private repository: GitHub offers required reviewers only for public
+# repositories below Enterprise Cloud (found 2026-09-08). The human gate is the
+# tag ruleset in the caller's repository, which restricts who may create `v*`.
+# Creating the tag is the approval.
 #
 # WHAT THIS COSTS. Production is a *rebuild of the tagged commit*, not a
 # byte-identical promotion of the staging binary. Mitigated by the lockfile, the
@@ -34,6 +41,14 @@ on:
         type: boolean
         required: false
         default: false
+      pg-major:
+        description: >-
+          Major version of the production Postgres. pg_dump refuses a server
+          newer than itself, and the runner image ships 16, so the matching
+          client is installed from the PGDG repository before the snapshot.
+        type: string
+        required: false
+        default: "18"
       environment:
         description: "GitHub environment holding the reviewer and the production secrets"
         type: string
@@ -58,6 +73,12 @@ on:
         required: true
       DATABASE_URL_PRODUCTION:
         description: Only needed when has-db is true
+        required: false
+      CF_ACCESS_CLIENT_ID:
+        description: Access service token id, sent on the smoke request when the Worker's previews sit behind Access
+        required: false
+      CF_ACCESS_CLIENT_SECRET:
+        description: Access service token secret for the smoke request
         required: false
 
 permissions:
@@ -97,20 +118,41 @@ jobs:
       - name: Build
         run: npx --no-install opennextjs-cloudflare build
 
-      # A snapshot before a migration, kept for 30 days. `pg_dump` is on the
-      # runner image; `--no-owner --no-acl` so the dump restores into a fresh
-      # database without the production roles existing.
+      # The runner image ships PostgreSQL 16 and `pg_dump` "cannot dump from
+      # PostgreSQL servers newer than its own major version; it will refuse to
+      # even try". The matching client comes from the PGDG repository.
+      - name: PostgreSQL client matching the server
+        if: inputs.has-db
+        env:
+          PG_MAJOR: ${{ inputs.pg-major }}
+        run: |
+          set -euo pipefail
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          . /etc/os-release
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq "postgresql-client-${PG_MAJOR}"
+          "/usr/lib/postgresql/${PG_MAJOR}/bin/pg_dump" --version
+
+      # A snapshot before a migration, kept for 30 days. `--no-owner --no-acl`
+      # so the dump restores into a fresh database without the production roles
+      # existing. The versioned binary, not the Debian wrapper, which picks a
+      # version by local cluster and there is none.
       - name: Snapshot the production database
         if: inputs.has-db
         env:
           DATABASE_URL_PRODUCTION: ${{ secrets.DATABASE_URL_PRODUCTION }}
+          PG_MAJOR: ${{ inputs.pg-major }}
         run: |
           set -euo pipefail
           if [ -z "${DATABASE_URL_PRODUCTION:-}" ]; then
             echo "::error::has-db is true but DATABASE_URL_PRODUCTION is not set"
             exit 1
           fi
-          pg_dump --no-owner --no-acl --format=custom \
+          "/usr/lib/postgresql/${PG_MAJOR}/bin/pg_dump" --no-owner --no-acl --format=custom \
             --file="snapshot-${GITHUB_REF_NAME}.dump" "$DATABASE_URL_PRODUCTION"
           ls -lh "snapshot-${GITHUB_REF_NAME}.dump"
 
@@ -141,14 +183,23 @@ jobs:
 
       # The whole reason production is not Workers Builds: something runs between
       # upload and promote. A version that 500s never carries traffic.
+      # Version previews are their own workers.dev hostnames; when the Worker's
+      # previews sit behind Access, the smoke request carries the service token
+      # or it meets a login page. Empty secrets send no header.
       - name: Smoke the version preview
         id: smoke
         env:
           COMMAND_OUTPUT: ${{ steps.upload.outputs.command-output }}
           SMOKE_PATH: ${{ inputs.smoke-path }}
           SMOKE_MARKER: ${{ inputs.smoke-marker }}
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
         run: |
           set -euo pipefail
+          access_args=()
+          if [ -n "${CF_ACCESS_CLIENT_ID:-}" ] && [ -n "${CF_ACCESS_CLIENT_SECRET:-}" ]; then
+            access_args=(-H "CF-Access-Client-Id: $CF_ACCESS_CLIENT_ID" -H "CF-Access-Client-Secret: $CF_ACCESS_CLIENT_SECRET")
+          fi
           version_id="$(printf '%s' "$COMMAND_OUTPUT" | sed -n 's/.*Worker Version ID:[[:space:]]*\([0-9a-f-]\{36\}\).*/\1/p' | head -1)"
           preview="$(printf '%s' "$COMMAND_OUTPUT" | grep -oE 'https://[a-z0-9-]+\.[a-z0-9-]+\.workers\.dev' | head -1)"
 
@@ -164,7 +215,7 @@ jobs:
           fi
 
           body="$(mktemp)"
-          code="$(curl -sS -o "$body" -w '%{http_code}' --max-time 30 "${preview}${SMOKE_PATH}")"
+          code="$(curl -sS -o "$body" -w '%{http_code}' --max-time 30 "${access_args[@]}" "${preview}${SMOKE_PATH}")"
           echo "smoke: $preview$SMOKE_PATH -> HTTP $code"
           [ "$code" = "200" ] || { echo "::error::smoke test returned HTTP $code"; exit 1; }
 

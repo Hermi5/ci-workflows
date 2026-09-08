@@ -59,6 +59,22 @@ on:
         type: string
         required: false
         default: ""
+      subdomain:
+        description: >-
+          The workers.dev subdomain of the Cloudflare account that carries the
+          preview Worker. Each account has its own; a repo in a client's account
+          passes that account's.
+        type: string
+        required: false
+        default: hermannstern
+      run-site-checks:
+        description: >-
+          Run the caller's `site-checks` Playwright project against the preview.
+          Off for an app that is entirely behind a sign-in: site-checks samples a
+          public sitemap, and a gate that is always red stops being read.
+        type: boolean
+        required: false
+        default: true
     secrets:
       CF_ACCESS_CLIENT_ID:
         description: Cloudflare Access service token id for the preview
@@ -115,9 +131,16 @@ jobs:
         if: always()
         run: npx --no-install biome format .
 
+      # Next 16 writes `.next/types/routes.d.ts` (LayoutProps, PageProps) only
+      # when `next typegen` or a build has run, and a clean checkout has neither;
+      # a bare `tsc` on an app that uses those types fails on a file nobody
+      # changed. Typegen first when the repo has Next at all.
       - name: Typecheck
         if: always()
-        run: npx --no-install tsc --noEmit
+        run: |
+          set -euo pipefail
+          if [ -x node_modules/.bin/next ]; then npx --no-install next typegen; fi
+          npx --no-install tsc --noEmit
 
       # `--passWithNoTests` is not a pass, it is a gap, and it says so out loud.
       # 17 repos arrived with zero tests; failing them would have got this
@@ -188,7 +211,7 @@ jobs:
         with:
           alias: ${{ inputs.preview-alias }}
           worker-name: ${{ github.event.repository.name }}-staging
-          subdomain: hermannstern
+          subdomain: ${{ inputs.subdomain }}
           access-client-id: ${{ secrets.CF_ACCESS_CLIENT_ID }}
           access-client-secret: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
 
@@ -227,7 +250,7 @@ jobs:
 
       # Gate matrix: advisory, blocking after one green week on the repo.
       - name: site-checks
-        if: always() && inputs.run-e2e
+        if: always() && inputs.run-e2e && inputs.run-site-checks
         continue-on-error: true
         env:
           SITE_URL: ${{ steps.url.outputs.url }}
