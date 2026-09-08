@@ -165,11 +165,21 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
+      # The secret carries libpq's form (`sslmode=verify-full&sslrootcert=system`),
+      # which pg_dump above needs. drizzle-kit's driver, postgres.js, forwards
+      # unknown URL parameters to the server as options, and PlanetScale answers
+      # `unrecognized configuration parameter "sslrootcert"` (found 2026-09-08).
+      # So the driver gets the same URL minus that one parameter; verify-full
+      # still applies, postgres.js verifies against the system store.
       - name: Migrate
         if: inputs.has-db
         env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL_PRODUCTION }}
-        run: npx --no-install drizzle-kit migrate
+          DATABASE_URL_PRODUCTION: ${{ secrets.DATABASE_URL_PRODUCTION }}
+        run: |
+          set -euo pipefail
+          url="${DATABASE_URL_PRODUCTION//&sslrootcert=system/}"
+          url="${url//\?sslrootcert=system&/?}"
+          DATABASE_URL="$url" npx --no-install drizzle-kit migrate
 
       # Upload without promoting. The new version exists and is reachable on its
       # own preview URL; live traffic still goes to the previous one.
