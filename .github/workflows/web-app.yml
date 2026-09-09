@@ -91,6 +91,12 @@ on:
       GITLEAKS_LICENSE:
         description: Organisation licence for gitleaks-action. Personal repos need none.
         required: false
+      E2E_EMAIL:
+        description: Signed-in e2e user on the preview's database (Better Auth email/password, no second factor)
+        required: false
+      E2E_PASSWORD:
+        description: Its password
+        required: false
 
 # A second push to the same PR cancels the first. Nothing in here has side
 # effects, so an in-flight run of superseded code is pure waste.
@@ -246,6 +252,8 @@ jobs:
           SITE_URL: ${{ steps.url.outputs.url }}
           CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
           CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          E2E_EMAIL: ${{ secrets.E2E_EMAIL }}
+          E2E_PASSWORD: ${{ secrets.E2E_PASSWORD }}
         run: |
           set -euo pipefail
           npx --no-install playwright install --with-deps chromium
