@@ -292,7 +292,7 @@ jobs:
         run: |
           set -euo pipefail
           npx --no-install playwright install --with-deps chromium
-          npx --no-install playwright test --project=e2e
+          bash .ci-workflows/scripts/run-browser-tests.sh e2e
 
       # Gate matrix: advisory, blocking after one green week on the repo.
       - name: site-checks
@@ -302,7 +302,7 @@ jobs:
           SITE_URL: ${{ steps.url.outputs.url }}
           CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
           CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
-        run: npx --no-install playwright test --project=site-checks
+        run: bash .ci-workflows/scripts/run-browser-tests.sh site-checks
 
       # `@lhci/cli` rather than an action: it is the fleet's proven path
       # (StellaVie ran it this way from 2026-08) and it needs no third-party SHA.

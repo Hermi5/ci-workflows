@@ -51,10 +51,12 @@ class ShellControls(unittest.TestCase):
                    'RUNNER_TEMP': directory, 'TMPDIR': directory}
             env.update(values or {})
             for name, value in (files or {}).items():
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
                 (root / name).write_text(value)
             result = subprocess.run(['/bin/bash', '-c', prefix + '\n' + body], cwd=root,
                                     env=env, capture_output=True, text=True, timeout=5)
             result.outputs = (root / 'out').read_text() if (root / 'out').exists() else ''
+            result.remaining_private_dirs = list(root.glob('playwright-results.*'))
             return result
 
     def preview(self, sha=SHA, header=None, status='200', body='Sign in', site_url=''):
@@ -154,6 +156,87 @@ class ShellControls(unittest.TestCase):
         self.assertIn('path: .lighthouseci/\n', uploads[0])
         self.assertNotIn('playwright-report/', web)
         self.assertNotIn('test-results/', web)
+
+    def browser_report(self, status='expected', message=''):
+        return {
+            'stats': {name: int(name == status) for name in ['expected', 'unexpected', 'flaky', 'skipped']},
+            'errors': [],
+            'suites': [{'specs': [{'title': 'Synthetic browser test', 'file': 'e2e/synthetic.spec.ts', 'line': 7,
+                                   'tests': [{'status': status, 'results': [{'errors': [{'message': message}]}]}]}]}],
+        }
+
+    def browser_summary(self, report=None, raw=None):
+        files = {'.ci-workflows/scripts/summarize-browser-results.py': (ROOT / 'scripts/summarize-browser-results.py').read_text()}
+        if report is not None or raw is not None:
+            files['report.json'] = raw if raw is not None else json.dumps(report)
+        return self.run_shell('python3 .ci-workflows/scripts/summarize-browser-results.py report.json', files=files)
+
+    def test_browser_summary_never_emits_error_output_or_header_canaries(self):
+        canary = 'DO_NOT_PUBLISH_SESSION_CANARY'
+        report = self.browser_report('unexpected', 'expect(locator).toBeVisible() ' + canary)
+        report['errors'] = [{'message': canary, 'stack': canary}]
+        result = report['suites'][0]['specs'][0]['tests'][0]['results'][0]
+        result.update({'stdout': [{'text': 'timeout ' + canary}], 'stderr': [{'text': canary}],
+                       'headers': {'Cookie': canary, 'CF-Access-Client-Secret': canary},
+                       'steps': [{'error': {'message': canary, 'stack': canary}}],
+                       'attachments': [{'body': canary}]})
+        summary = self.browser_summary(report)
+        self.assertEqual(summary.returncode, 1)
+        self.assertNotIn(canary, summary.stdout + summary.stderr)
+        self.assertNotIn('Cookie', summary.stdout + summary.stderr)
+        self.assertIn('Synthetic browser test', summary.stdout)
+        self.assertIn('e2e/synthetic.spec.ts', summary.stdout)
+        self.assertIn('assertion', summary.stdout)
+
+    def test_browser_summary_exit_status_and_invalid_reports(self):
+        for status, expected in [('expected', 0), ('unexpected', 1), ('flaky', 0), ('skipped', 0)]:
+            self.assertEqual(self.browser_summary(self.browser_report(status)).returncode, expected)
+        report = self.browser_report()
+        report['errors'] = [{'message': 'synthetic runner error'}]
+        self.assertEqual(self.browser_summary(report).returncode, 1)
+        self.assertEqual(self.browser_summary().returncode, 1)
+        for raw in ['', '{broken', '{"suites":[]}', '{"stats":null}', 'null']:
+            result = self.browser_summary(raw=raw)
+            self.assertEqual(result.returncode, 1)
+            self.assertEqual(result.stdout.strip(), 'Browser tests: runner error (missing or malformed JSON report)')
+
+    def test_browser_summary_uses_fixed_error_categories(self):
+        cases = [('Required TOTP coverage needs E2E_TOTP_EMAIL', 'missing fixture'),
+                 ('page.goto: net::ERR_ABORTED', 'navigation aborted'),
+                 ('Test timeout of 30000ms exceeded', 'timeout'),
+                 ('expect(locator).toBeVisible()', 'assertion'), ('transport problem', 'runner error'),
+                 ('transport problem\ncode frame: expect(1).toBe(1)', 'runner error')]
+        for message, category in cases:
+            result = self.browser_summary(self.browser_report('unexpected', message))
+            self.assertIn(' | ' + category, result.stdout)
+            self.assertNotIn(message, result.stdout)
+
+    def test_browser_capture_preserves_exit_and_removes_private_files(self):
+        files = {'.ci-workflows/scripts/' + name: (ROOT / 'scripts' / name).read_text()
+                 for name in ['run-browser-tests.sh', 'summarize-browser-results.py']}
+        mock = '''
+npx() {
+  python3 -c 'import os, stat, sys; sys.stdout.write(os.environ["MOCK_REPORT"]); sys.stderr.write("PRIVATE_STDERR_CANARY"); open(os.environ["GITHUB_OUTPUT"], "a").write("modes=" + oct(stat.S_IMODE(os.fstat(1).st_mode)) + "," + oct(stat.S_IMODE(os.fstat(2).st_mode)) + "\\n")'
+  return "$MOCK_EXIT"
+}
+export -f npx
+'''
+        for runner_exit, report, expected in [(0, json.dumps(self.browser_report()), 0),
+                                              (7, json.dumps(self.browser_report()), 7),
+                                              (0, '{broken', 1),
+                                              (0, json.dumps(self.browser_report('unexpected')), 1)]:
+            result = self.run_shell('bash .ci-workflows/scripts/run-browser-tests.sh e2e',
+                                    {'MOCK_REPORT': report, 'MOCK_EXIT': str(runner_exit)}, files, mock)
+            self.assertEqual(result.returncode, expected, result.stderr)
+            self.assertNotIn('PRIVATE_STDERR_CANARY', result.stdout + result.stderr)
+            self.assertIn('modes=0o600,0o600', result.outputs)
+            self.assertEqual(result.remaining_private_dirs, [])
+
+    def test_both_playwright_projects_use_the_pinned_private_runner(self):
+        web = WEB.read_text()
+        self.assertIn('bash .ci-workflows/scripts/run-browser-tests.sh e2e', web)
+        self.assertIn('bash .ci-workflows/scripts/run-browser-tests.sh site-checks', web)
+        self.assertNotIn('playwright test --project=', web)
 
 
 class Eligibility(unittest.TestCase):

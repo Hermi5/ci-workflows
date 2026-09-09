@@ -158,8 +158,12 @@ to make a red suite go away; that converts a real bug into an intermittent one.
 Authenticated suites must disable Playwright tracing. This workflow does not
 upload Playwright HTML reports or test results: traces and API transport errors
 can retain Access headers, passwords, and session cookies. Reintroducing report
-uploads requires tested credential redaction. This does not sanitize runner
-stdout. Lighthouse reports are retained only when Lighthouse is enabled.
+uploads requires tested credential redaction. Both Playwright projects capture
+raw JSON and stderr in private temporary files outside the checkout, then remove
+them. CI receives only counts, failed test titles and source locations, and fixed
+error categories. A failed command or invalid report still fails the gate. This
+does not redact standard Playwright reports or arbitrary caller commands.
+Lighthouse reports are retained only when Lighthouse is enabled.
 
 ## Pinning
 
