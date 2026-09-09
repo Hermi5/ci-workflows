@@ -21,11 +21,19 @@ on:
     branches: [main]
 jobs:
   ci:
+    permissions:
+      contents: read
+      pull-requests: read
     uses: Hermi5/ci-workflows/.github/workflows/web-app.yml@v1
     with:
       run-e2e: true
       run-lhci: true
-    secrets: inherit
+    secrets:
+      CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+      CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
 ```
 
 And `.github/workflows/release.yml`:
@@ -41,11 +49,22 @@ jobs:
     with:
       has-db: true
       smoke-marker: "<html"
-    secrets: inherit
+    secrets:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      DATABASE_URL_PRODUCTION: ${{ secrets.DATABASE_URL_PRODUCTION }}
+      CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+      CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
 ```
 
-`secrets: inherit` is deliberate. The alternative is naming five secrets in every
-one of seventeen repos and re-editing all of them the day a sixth is added.
+Secrets are passed by name, five lines per caller. `secrets: inherit` was the
+first draft, and on the first organisation repository it delivered EMPTY values
+for every secret the called workflow declares under `workflow_call.secrets`,
+while a plain job in the same pull request saw them all (SAK-Industries/sak-portal
+PR #1, 2026-09-09). The caller job also grants `contents: read` and
+`pull-requests: read`: a called workflow may not request more than its caller
+holds, the organisation default is contents-read only, and gitleaks-action lists
+the pull request's commits.
 
 ### Workflows
 

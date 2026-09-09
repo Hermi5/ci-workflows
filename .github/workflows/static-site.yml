@@ -56,9 +56,13 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
 
 jobs:
   gates:
+    permissions:
+      contents: read
+      pull-requests: read
     uses: Hermi5/ci-workflows/.github/workflows/web-app.yml@v1
     with:
       node-version: ${{ inputs.node-version }}
@@ -67,4 +71,9 @@ jobs:
       run-lhci: ${{ inputs.run-lhci }}
       preview-alias: ${{ inputs.preview-alias }}
       site-url: ${{ inputs.site-url }}
-    secrets: inherit
+    secrets:
+      CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+      CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
