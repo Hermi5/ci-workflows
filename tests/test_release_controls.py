@@ -132,7 +132,28 @@ class ShellControls(unittest.TestCase):
     def test_production_authority_is_absent_from_pr_contract(self):
         self.assertNotIn('CLOUDFLARE_API_TOKEN', WEB.read_text())
         self.assertNotIn('CLOUDFLARE_ACCOUNT_ID', WEB.read_text())
-        self.assertIn('needs: [fast, audit]\n    if: always()', WEB.read_text())
+
+    def test_preview_job_is_cancellable_without_skipping_failed_prerequisites(self):
+        preview = WEB.read_text().split('  preview-gates:\n', 1)[1].split('\n  audit:', 1)[0]
+        job = preview.split('    steps:\n', 1)[0]
+        self.assertIn('    needs: [fast, audit]\n', job)
+        self.assertIn('    if: ${{ !cancelled() }}\n', job)
+        self.assertNotIn('always()', job)
+        # !cancelled() still schedules the job after dependency failure/skip;
+        # its actual first step must then fail, not turn a missing audit green.
+        for audit in ['failure', 'skipped']:
+            result = self.run_shell(script(WEB, 'Require successful prerequisites'),
+                                    {'FAST_RESULT': 'success', 'AUDIT_RESULT': audit})
+            self.assertNotEqual(result.returncode, 0)
+
+    def test_report_upload_excludes_authenticated_playwright_files(self):
+        web = WEB.read_text()
+        uploads = [step for step in web.split('      - ') if 'uses: actions/upload-artifact@' in step]
+        self.assertEqual(len(uploads), 1)
+        self.assertIn('if: ${{ !cancelled() && inputs.run-lhci }}', uploads[0])
+        self.assertIn('path: .lighthouseci/\n', uploads[0])
+        self.assertNotIn('playwright-report/', web)
+        self.assertNotIn('test-results/', web)
 
 
 class Eligibility(unittest.TestCase):

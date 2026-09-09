@@ -205,7 +205,8 @@ jobs:
   preview-gates:
     name: preview-gates
     needs: [fast, audit]
-    if: always()
+    # Check failed prerequisites explicitly, but stop a superseded run.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -400,15 +401,14 @@ jobs:
           access-client-id: ${{ secrets.CF_ACCESS_CLIENT_ID }}
           access-client-secret: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
 
-      - name: Upload Playwright and Lighthouse reports
-        if: always()
+      # Authenticated Playwright reports can retain credentials even with tracing
+      # disabled. Do not upload them without a tested redaction process.
+      - name: Upload Lighthouse reports
+        if: ${{ !cancelled() && inputs.run-lhci }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: preview-gates-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            playwright-report/
-            test-results/
-            .lighthouseci/
+          name: lighthouse-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .lighthouseci/
           retention-days: 14
           if-no-files-found: ignore
 
