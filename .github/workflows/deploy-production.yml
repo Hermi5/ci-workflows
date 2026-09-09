@@ -210,8 +210,10 @@ jobs:
           if [ -n "${CF_ACCESS_CLIENT_ID:-}" ] && [ -n "${CF_ACCESS_CLIENT_SECRET:-}" ]; then
             access_args=(-H "CF-Access-Client-Id: $CF_ACCESS_CLIENT_ID" -H "CF-Access-Client-Secret: $CF_ACCESS_CLIENT_SECRET")
           fi
-          version_id="$(printf '%s' "$COMMAND_OUTPUT" | sed -n 's/.*Worker Version ID:[[:space:]]*\([0-9a-f-]\{36\}\).*/\1/p' | head -1)"
-          preview="$(printf '%s' "$COMMAND_OUTPUT" | grep -oE 'https://[a-z0-9-]+\.[a-z0-9-]+\.workers\.dev' | head -1)"
+          # `|| true` on both: under pipefail a no-match grep would end the step
+          # before the explanations below (a release died that way 2026-09-09).
+          version_id="$(printf '%s' "$COMMAND_OUTPUT" | grep -oE -m1 'Version ID:[[:space:]]*[0-9a-f-]{36}' | grep -oE '[0-9a-f-]{36}' || true)"
+          preview="$(printf '%s' "$COMMAND_OUTPUT" | grep -oE -m1 'https://[a-z0-9-]+\.[a-z0-9-]+\.workers\.dev' || true)"
 
           if [ -z "$version_id" ]; then
             echo "::error::no Worker Version ID in the wrangler output; refusing to promote"
@@ -220,7 +222,7 @@ jobs:
           echo "version-id=$version_id" >> "$GITHUB_OUTPUT"
 
           if [ -z "$preview" ]; then
-            echo "::error::no version preview URL in the wrangler output; refusing to promote an unsmoked version"
+            echo "::error::no version preview URL in the wrangler output; refusing to promote an unsmoked version. Version previews are a Worker trigger: enable \`preview_urls\` in wrangler.jsonc and apply it once with \`wrangler triggers deploy\` (or a first \`wrangler deploy\`); \`versions upload\` alone never turns them on."
             exit 1
           fi
 
