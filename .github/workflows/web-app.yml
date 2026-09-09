@@ -100,6 +100,9 @@ concurrency:
 
 permissions:
   contents: read
+  # gitleaks-action lists the pull request's commits through the workflow
+  # token on pull_request events; without this it gets 403 (seen 2026-09-09).
+  pull-requests: read
 
 jobs:
   fast:
