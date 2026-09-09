@@ -216,7 +216,22 @@ class ShellControls(unittest.TestCase):
                  for name in ['run-browser-tests.sh', 'summarize-browser-results.py']}
         mock = '''
 npx() {
-  python3 -c 'import os, stat, sys; sys.stdout.write(os.environ["MOCK_REPORT"]); sys.stderr.write("PRIVATE_STDERR_CANARY"); open(os.environ["GITHUB_OUTPUT"], "a").write("modes=" + oct(stat.S_IMODE(os.fstat(1).st_mode)) + "," + oct(stat.S_IMODE(os.fstat(2).st_mode)) + "\\n")'
+  python3 - "$@" <<'PY'
+import os, stat, sys
+from pathlib import Path
+outputs = [arg.split('=', 1)[1] for arg in sys.argv[1:] if arg.startswith('--output=')]
+assert len(outputs) == 1
+output = Path(outputs[0])
+assert output.parent.name.startswith('playwright-results.')
+output.mkdir(parents=True)
+state = output / 'auth-worker-0.json'
+state.write_text('PRIVATE_AUTH_COOKIE_CANARY')
+sys.stdout.write(os.environ['MOCK_REPORT'])
+sys.stderr.write('PRIVATE_STDERR_CANARY')
+with open(os.environ['GITHUB_OUTPUT'], 'a') as record:
+    record.write('modes=' + oct(stat.S_IMODE(os.fstat(1).st_mode)) + ',' + oct(stat.S_IMODE(os.fstat(2).st_mode)) + '\\n')
+    record.write('auth-state-mode=' + oct(stat.S_IMODE(state.stat().st_mode)) + '\\n')
+PY
   return "$MOCK_EXIT"
 }
 export -f npx
@@ -229,7 +244,9 @@ export -f npx
                                     {'MOCK_REPORT': report, 'MOCK_EXIT': str(runner_exit)}, files, mock)
             self.assertEqual(result.returncode, expected, result.stderr)
             self.assertNotIn('PRIVATE_STDERR_CANARY', result.stdout + result.stderr)
+            self.assertNotIn('PRIVATE_AUTH_COOKIE_CANARY', result.stdout + result.stderr)
             self.assertIn('modes=0o600,0o600', result.outputs)
+            self.assertIn('auth-state-mode=0o600', result.outputs)
             self.assertEqual(result.remaining_private_dirs, [])
 
     def test_both_playwright_projects_use_the_pinned_private_runner(self):
