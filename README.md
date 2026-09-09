@@ -7,8 +7,15 @@ nothing in here is a secret. Every credential arrives from the calling repo.
 
 The model it implements: two Workers per site through wrangler environments,
 **Workers Builds owns PR previews and staging on `main`**, and **GitHub Actions
-owns production on a `v*` tag**. Actions never deploys staging and never runs
-heavy gates on a push to `main`.
+owns production on a `v*` tag**. Actions never deploys staging. Main push runs
+establish acceptance for the exact merged commit before it can be released.
+
+This remediation is opt-in. Publish and pin its reviewed commit in both the
+caller `uses:` reference and the required `ci-ref` input; do not move fleet-wide
+`v1`. The app must return `X-SAK-Build-SHA` with its actual build commit.
+
+Run the isolated release-control regressions with
+`PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v`.
 
 ## Calling it
 
@@ -19,20 +26,23 @@ name: CI
 on:
   pull_request:
     branches: [main]
+  push:
+    branches: [main]
 jobs:
   ci:
     permissions:
       contents: read
       pull-requests: read
-    uses: Hermi5/ci-workflows/.github/workflows/web-app.yml@v1
+    uses: Hermi5/ci-workflows/.github/workflows/web-app.yml@<reviewed-commit-sha>
     with:
+      ci-ref: <reviewed-commit-sha>
       run-e2e: true
       run-lhci: true
+      # On main pushes, pass the canonical staging URL instead of a PR alias.
+      site-url: ${{ github.event_name == 'push' && 'https://your-staging-host' || '' }}
     secrets:
       CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
       CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
       E2E_EMAIL: ${{ secrets.E2E_EMAIL }}
       E2E_PASSWORD: ${{ secrets.E2E_PASSWORD }}
@@ -47,19 +57,31 @@ on:
     tags: ["v*"]
 jobs:
   deploy:
-    uses: Hermi5/ci-workflows/.github/workflows/deploy-production.yml@v1
+    permissions:
+      contents: read
+      actions: read
+    uses: Hermi5/ci-workflows/.github/workflows/deploy-production.yml@<reviewed-commit-sha>
     with:
+      ci-ref: <reviewed-commit-sha>
       has-db: true
       smoke-marker: "<html"
     secrets:
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-      DATABASE_URL_PRODUCTION: ${{ secrets.DATABASE_URL_PRODUCTION }}
       CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
       CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
 ```
 
-Secrets are passed by name, five lines per caller. `secrets: inherit` was the
+PR test credentials are passed by name. Production `CLOUDFLARE_API_TOKEN`,
+`CLOUDFLARE_ACCOUNT_ID`, and `DATABASE_URL_PRODUCTION` belong only to the
+production GitHub environment. Remove the production API token from repository
+and organization secrets available to PRs; removing its caller line alone cannot
+stop a changed PR workflow from requesting a repository secret. The release job
+reads environment secrets directly after the separate eligibility job succeeds.
+
+SAK's required TOTP fixture additionally needs `E2E_TOTP_EMAIL`,
+`E2E_TOTP_PASSWORD`, and `E2E_TOTP_SECRET` passed by name. Use an isolated synthetic
+staging identity; do not use a production account or a person's authenticator.
+
+`secrets: inherit` was the
 first draft, and on the first organisation repository it delivered EMPTY values
 for every secret the called workflow declares under `workflow_call.secrets`,
 while a plain job in the same pull request saw them all (SAK-Industries/sak-portal
@@ -72,7 +94,7 @@ the pull request's commits.
 
 | File | For | Trigger the caller uses |
 | --- | --- | --- |
-| `web-app.yml` | Next app on Workers, with a database | `pull_request` |
+| `web-app.yml` | Next app on Workers, with a database | `pull_request`, `push: main` |
 | `static-site.yml` | Next site with no database (delegates to `web-app.yml`) | `pull_request` |
 | `python-daemon.yml` | the uv/ruff/pytest daemons | `pull_request` |
 | `deploy-production.yml` | release | `push: tags: v*` |
@@ -83,7 +105,7 @@ the pull request's commits.
 | Action | Does |
 | --- | --- |
 | `actions/setup-runtime` | reads `.nvmrc` / `mise.toml`, detects npm vs pnpm, caches, installs lockfile-exact |
-| `actions/wait-for-preview` | reproduces Cloudflare's alias sanitizer, polls the preview URL with Access service-token headers |
+| `actions/wait-for-preview` | polls an alias or staging URL until its build SHA equals the expected candidate; a second check rejects an alias that advanced during tests |
 | `actions/launch-scan` | runs the vendored launch-check scanner, annotates, applies `launch-check.budget.json` |
 
 `actions/launch-scan/` holds a **vendored copy** of the agent-os `launch-check`
@@ -153,10 +175,10 @@ Lighthouse runs through `npx --yes @lhci/cli@0.15.x`, not through an action:
 that is the path StellaVie has run since 2026-08, and it is one fewer third-party
 SHA to keep current.
 
-The three `Hermi5/ci-workflows/actions/*@v1` references inside the workflows are
-**tag references, not SHAs, and they are internal**. They must be bumped in the
-same commit that moves the `v1` tag; a workflow calling `@v1` while the caller
-pins `@v2` would silently mix two generations.
+The updated web/release workflows pin unchanged setup/scan actions to their
+audited commit and check out changed helper code at the caller's immutable
+`ci-ref`. Pin `uses:` and `ci-ref` to the same published revision. No mutable tag
+needs to move. Other workflows remain on their existing release until migrated.
 
 Renovate keeps the SHAs current through `helpers:pinGitHubActionDigests`, so a
 pinned action is not a frozen one.
@@ -168,9 +190,10 @@ pinned action is not a frozen one.
 - **Cloudflare Access service token** with a Service Auth policy on each staging
   Worker, as `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET`. Tokens expire
   after at most a year; put the expiry alert on.
-- **Rulesets and environments on private repos need GitHub Pro.** `Hermi5` is a
-  personal account and today no repo in the fleet has any branch protection. The
-  required reviewer on `deploy-production.yml` is a no-op until that changes.
+- **Release authority remains an owner configuration step.** Private Team repos
+  support environments and tag rules but not required environment reviewers.
+  Separate agent credentials from owner/tag/deployment authority. The source
+  guard proves main ancestry and successful exact-SHA CI, not human approval.
 - **pnpm repos need a `packageManager` field** in `package.json`; corepack cannot
   pick a version without it, and `setup-runtime` fails loudly rather than
   installing whatever is newest.

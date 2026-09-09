@@ -8,26 +8,28 @@ name: deploy-production
 # the job is one serialized sequence: snapshot, migrate, upload without traffic,
 # smoke, promote.
 #
-# WHERE THE APPROVAL ACTUALLY LIVES. `environment: production` holds the
-# production secrets and the tag policy. It does NOT hold a required reviewer on
-# a private repository: GitHub offers required reviewers only for public
-# repositories below Enterprise Cloud (found 2026-09-08). The human gate is the
-# tag ruleset in the caller's repository, which restricts who may create `v*`.
-# Creating the tag is the approval.
+# Production secrets belong only to the production environment. A tag must pass
+# read-only exact-commit/main acceptance before that environment is entered.
+# Owner and agent credentials still need distinct authority: this source check
+# cannot establish human approval when they share the same owner identity.
 #
 # WHAT THIS COSTS. Production is a *rebuild of the tagged commit*, not a
 # byte-identical promotion of the staging binary. Mitigated by the lockfile, the
 # pinned Node major and the same build image; the fallback is `wrangler rollback`
 # (100 versions retained).
 #
-# EXPAND/CONTRACT IS MANDATORY, not a preference. `wrangler rollback` does not
-# revert bindings or the database, so a rollback across a destructive migration
+# EXPAND/CONTRACT IS MANDATORY. A Worker version includes bindings but does not
+# rewind external database contents, so a rollback across a destructive migration
 # leaves the old code pointed at the new schema. Every migration must work
 # against both the old and the new code.
 
 on:
   workflow_call:
     inputs:
+      ci-ref:
+        description: "Full commit SHA of this workflow and its eligibility script"
+        type: string
+        required: true
       node-version:
         type: string
         required: false
@@ -50,7 +52,7 @@ on:
         required: false
         default: "18"
       environment:
-        description: "GitHub environment holding the reviewer and the production secrets"
+        description: "GitHub environment holding production secrets and tag restrictions"
         type: string
         required: false
         default: production
@@ -67,13 +69,6 @@ on:
         required: false
         default: ""
     secrets:
-      CLOUDFLARE_API_TOKEN:
-        required: true
-      CLOUDFLARE_ACCOUNT_ID:
-        required: true
-      DATABASE_URL_PRODUCTION:
-        description: Only needed when has-db is true
-        required: false
       CF_ACCESS_CLIENT_ID:
         description: Access service token id, sent on the smoke request when the Worker's previews sit behind Access
         required: false
@@ -83,6 +78,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 # Never cancel a release in flight. Cancelling between `versions upload` and
 # `versions deploy` leaves an uploaded version that carries no traffic and a
@@ -92,8 +88,27 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  eligibility:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Validate CI revision
+        env:
+          CI_REF: ${{ inputs.ci-ref }}
+        run: '[[ "$CI_REF" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Hermi5/ci-workflows
+          ref: ${{ inputs.ci-ref }}
+          persist-credentials: false
+      - name: Require accepted main commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/verify-release.py
+
   release:
     name: release
+    needs: eligibility
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment }}
     timeout-minutes: 45
@@ -102,12 +117,13 @@ jobs:
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       WRANGLER_SEND_METRICS: "false"
     steps:
-      # The tag, not the branch head. `github.ref` on a tag push is the tag.
+      # Check out the immutable commit validated by eligibility, even if the
+      # owner moves the tag while this run is waiting.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.ref }}
+          ref: ${{ github.sha }}
 
-      - uses: Hermi5/ci-workflows/actions/setup-runtime@v1
+      - uses: Hermi5/ci-workflows/actions/setup-runtime@d8cbb15e697c67d2da65550bf68c04f4885a5964
         with:
           node-version: ${{ inputs.node-version }}
           package-manager: ${{ inputs.package-manager }}
@@ -185,11 +201,13 @@ jobs:
       # own preview URL; live traffic still goes to the previous one.
       - name: Upload the version
         id: upload
-        uses: cloudflare/wrangler-action@ebbaa1584979971c8614a24965b4405ff95890e0 # v4.0.0
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: versions upload --tag ${{ github.ref_name }} --message "release ${{ github.ref_name }}"
+        env:
+          CLOUDFLARE_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CLOUDFLARE_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+          npx --no-install opennextjs-cloudflare upload -- --tag "$GITHUB_REF_NAME" --message "release $GITHUB_REF_NAME" \
+            2>&1 | tee "$RUNNER_TEMP/opennext-upload.log"
 
       # The whole reason production is not Workers Builds: something runs between
       # upload and promote. A version that 500s never carries traffic.
@@ -199,27 +217,27 @@ jobs:
       - name: Smoke the version preview
         id: smoke
         env:
-          COMMAND_OUTPUT: ${{ steps.upload.outputs.command-output }}
           SMOKE_PATH: ${{ inputs.smoke-path }}
           SMOKE_MARKER: ${{ inputs.smoke-marker }}
           CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
           CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
         run: |
           set -euo pipefail
+          COMMAND_OUTPUT="$(cat "$RUNNER_TEMP/opennext-upload.log")"
           access_args=()
           if [ -n "${CF_ACCESS_CLIENT_ID:-}" ] && [ -n "${CF_ACCESS_CLIENT_SECRET:-}" ]; then
             access_args=(-H "CF-Access-Client-Id: $CF_ACCESS_CLIENT_ID" -H "CF-Access-Client-Secret: $CF_ACCESS_CLIENT_SECRET")
           fi
           # `|| true` on both: under pipefail a no-match grep would end the step
           # before the explanations below (a release died that way 2026-09-09).
-          version_id="$(printf '%s' "$COMMAND_OUTPUT" | grep -oE -m1 'Version ID:[[:space:]]*[0-9a-f-]{36}' | grep -oE '[0-9a-f-]{36}' || true)"
-          preview="$(printf '%s' "$COMMAND_OUTPUT" | grep -oE -m1 'https://[a-z0-9-]+\.[a-z0-9-]+\.workers\.dev' || true)"
+          version_id="$(printf '%s' "$COMMAND_OUTPUT" | grep -oE 'Version ID:[[:space:]]*[0-9a-f-]{36}' | grep -oE '[0-9a-f-]{36}' | tail -1 || true)"
 
           if [ -z "$version_id" ]; then
             echo "::error::no Worker Version ID in the wrangler output; refusing to promote"
             exit 1
           fi
           echo "version-id=$version_id" >> "$GITHUB_OUTPUT"
+          preview="$(printf '%s' "$COMMAND_OUTPUT" | grep -oE "https://${version_id:0:8}-[a-z0-9-]+\.[a-z0-9-]+\.workers\.dev" | tail -1 || true)"
 
           if [ -z "$preview" ]; then
             echo "::error::no version preview URL in the wrangler output; refusing to promote an unsmoked version. Version previews are a Worker trigger: enable \`preview_urls\` in wrangler.jsonc and apply it once with \`wrangler triggers deploy\` (or a first \`wrangler deploy\`); \`versions upload\` alone never turns them on."
@@ -227,7 +245,7 @@ jobs:
           fi
 
           body="$(mktemp)"
-          code="$(curl -sS -o "$body" -w '%{http_code}' --max-time 30 "${access_args[@]}" "${preview}${SMOKE_PATH}")"
+          code="$(curl -sS -o "$body" -w '%{http_code}' --max-time 30 ${access_args[@]+"${access_args[@]}"} "${preview}${SMOKE_PATH}")"
           echo "smoke: $preview$SMOKE_PATH -> HTTP $code"
           [ "$code" = "200" ] || { echo "::error::smoke test returned HTTP $code"; exit 1; }
 
@@ -259,5 +277,5 @@ jobs:
             echo "- commit \`${GITHUB_SHA}\`"
             echo "- worker version \`${VERSION_ID:-none}\`"
             echo "- rollback: \`wrangler rollback\`, or \`wrangler versions deploy <previous-id>@100%\`"
-            echo "- bindings and the database are NOT reverted by a rollback; that is why migrations are expand/contract"
+            echo "- rollback selects versioned code/bindings; external database contents are not rewound"
           } >> "$GITHUB_STEP_SUMMARY"

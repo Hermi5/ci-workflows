@@ -2,11 +2,8 @@ name: web-app
 
 # The fleet's PR gate for a Next app on Cloudflare Workers.
 #
-# TRIGGER. `workflow_call` only. The caller wires it to `pull_request` and to
-# nothing else. Never `push: main`, because Workers Builds already deploys staging on
-# every merge, so a second heavy run there buys nothing and the minute budget is
-# tight: ~13 min per PR run x 17 sites x ~8 pushes/month is already ~1,770 of
-# 2,000 free minutes.
+# Call on pull requests and main pushes when releases require exact merged-SHA
+# acceptance. Workers Builds still owns deployments to previews and staging.
 #
 # SHAPE. Four jobs, and the split is the point.
 #   fast          - everything that needs no URL. Cheapest first, but every step
@@ -25,6 +22,14 @@ name: web-app
 on:
   workflow_call:
     inputs:
+      ci-ref:
+        description: "Full commit SHA of this workflow and its local actions"
+        type: string
+        required: true
+      preview-path:
+        description: "Public readiness path carrying X-SAK-Build-SHA"
+        type: string
+        default: /
       node-version:
         description: "Node major. Empty reads .nvmrc, then mise.toml, then 24."
         type: string
@@ -54,7 +59,7 @@ on:
         default: ""
       site-url:
         description: >-
-          Skip the preview wait and gate this URL instead. The escape hatch for a
+          Poll this URL instead of the derived branch alias. The escape hatch for a
           repo whose Worker is not named `<repo>-staging`.
         type: string
         required: false
@@ -82,12 +87,6 @@ on:
       CF_ACCESS_CLIENT_SECRET:
         description: Cloudflare Access service token secret for the preview
         required: false
-      CLOUDFLARE_API_TOKEN:
-        description: Needed only by the wrangler dry-run size check
-        required: false
-      CLOUDFLARE_ACCOUNT_ID:
-        description: Needed only by the wrangler dry-run size check
-        required: false
       GITLEAKS_LICENSE:
         description: Organisation licence for gitleaks-action. Personal repos need none.
         required: false
@@ -96,6 +95,12 @@ on:
         required: false
       E2E_PASSWORD:
         description: Its password
+        required: false
+      E2E_TOTP_EMAIL:
+        required: false
+      E2E_TOTP_PASSWORD:
+        required: false
+      E2E_TOTP_SECRET:
         required: false
 
 # A second push to the same PR cancels the first. Nothing in here has side
@@ -122,7 +127,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: Hermi5/ci-workflows/actions/setup-runtime@v1 # keep in step with the tag the caller uses
+      - uses: Hermi5/ci-workflows/actions/setup-runtime@d8cbb15e697c67d2da65550bf68c04f4885a5964 # keep in step with the tag the caller uses
         with:
           node-version: ${{ inputs.node-version }}
           package-manager: ${{ inputs.package-manager }}
@@ -182,7 +187,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: Hermi5/ci-workflows/actions/setup-runtime@v1
+      - uses: Hermi5/ci-workflows/actions/setup-runtime@d8cbb15e697c67d2da65550bf68c04f4885a5964
         with:
           node-version: ${{ inputs.node-version }}
           package-manager: ${{ inputs.package-manager }}
@@ -191,7 +196,7 @@ jobs:
       # fail-on-blocker: true, not by deleting the step.
       - name: launch-check
         continue-on-error: true
-        uses: Hermi5/ci-workflows/actions/launch-scan@v1
+        uses: Hermi5/ci-workflows/actions/launch-scan@d8cbb15e697c67d2da65550bf68c04f4885a5964
         with:
           path: .
           budget-file: launch-check.budget.json
@@ -199,13 +204,24 @@ jobs:
 
   preview-gates:
     name: preview-gates
-    needs: fast
+    needs: [fast, audit]
+    if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      - name: Require successful prerequisites
+        env:
+          FAST_RESULT: ${{ needs.fast.result }}
+          AUDIT_RESULT: ${{ needs.audit.result }}
+        run: |
+          [ "$FAST_RESULT" = success ] && [ "$AUDIT_RESULT" = success ] || {
+            echo "::error::fast and audit must both succeed"
+            exit 1
+          }
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: Hermi5/ci-workflows/actions/setup-runtime@v1
+      - uses: Hermi5/ci-workflows/actions/setup-runtime@d8cbb15e697c67d2da65550bf68c04f4885a5964
         with:
           node-version: ${{ inputs.node-version }}
           package-manager: ${{ inputs.package-manager }}
@@ -213,14 +229,29 @@ jobs:
       # The Worker that carries PR previews is `<repo>-staging` by fleet
       # convention (wrangler environments name themselves `<top-level>-<env>`).
       # A repo that breaks the convention passes `site-url` instead.
+      - name: Validate CI revision
+        env:
+          CI_REF: ${{ inputs.ci-ref }}
+        run: '[[ "$CI_REF" =~ ^[0-9a-f]{40}$ ]]'
+
+      - name: Check out the pinned CI actions
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Hermi5/ci-workflows
+          ref: ${{ inputs.ci-ref }}
+          path: .ci-workflows
+          persist-credentials: false
+
       - name: Wait for the preview
         id: preview
-        if: inputs.site-url == ''
-        uses: Hermi5/ci-workflows/actions/wait-for-preview@v1
+        uses: ./.ci-workflows/actions/wait-for-preview
         with:
           alias: ${{ inputs.preview-alias }}
           worker-name: ${{ github.event.repository.name }}-staging
           subdomain: ${{ inputs.subdomain }}
+          site-url: ${{ inputs.site-url }}
+          path: ${{ inputs.preview-path }}
+          expected-sha: ${{ github.event.pull_request.head.sha || github.sha }}
           access-client-id: ${{ secrets.CF_ACCESS_CLIENT_ID }}
           access-client-secret: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
 
@@ -254,6 +285,9 @@ jobs:
           CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
           E2E_EMAIL: ${{ secrets.E2E_EMAIL }}
           E2E_PASSWORD: ${{ secrets.E2E_PASSWORD }}
+          E2E_TOTP_EMAIL: ${{ secrets.E2E_TOTP_EMAIL }}
+          E2E_TOTP_PASSWORD: ${{ secrets.E2E_TOTP_PASSWORD }}
+          E2E_TOTP_SECRET: ${{ secrets.E2E_TOTP_SECRET }}
         run: |
           set -euo pipefail
           npx --no-install playwright install --with-deps chromium
@@ -326,15 +360,11 @@ jobs:
             process.exit(bad ? 1 : 0);
           '
 
-      # Gate matrix: advisory, blocking at 90% of the 3 MB Worker ceiling. The
-      # dry run is local, it needs no deploy and no traffic, but wrangler still
-      # wants an account when the config carries bindings.
+      # Local build and dry run receive no Cloudflare deployment credentials.
       - name: Worker size budget
         if: always()
         continue-on-error: true
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           WRANGLER_SEND_METRICS: "false"
         run: |
           set -euo pipefail
@@ -357,6 +387,18 @@ jobs:
             if (pct >= 90) { console.log(`::error::Worker bundle is at ${pct.toFixed(0)}% of budget`); process.exit(1); }
             if (pct >= 75) console.log(`::warning::Worker bundle is at ${pct.toFixed(0)}% of budget`);
           '
+
+      - name: Confirm the tested candidate is still served
+        uses: ./.ci-workflows/actions/wait-for-preview
+        with:
+          worker-name: ${{ github.event.repository.name }}-staging
+          subdomain: ${{ inputs.subdomain }}
+          site-url: ${{ steps.url.outputs.url }}
+          path: ${{ inputs.preview-path }}
+          expected-sha: ${{ github.event.pull_request.head.sha || github.sha }}
+          timeout-minutes: "0"
+          access-client-id: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          access-client-secret: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
 
       - name: Upload Playwright and Lighthouse reports
         if: always()
@@ -397,7 +439,7 @@ jobs:
         run: |
           node --input-type=module -e '
             import fs from "node:fs";
-            if (!fs.existsSync("osv.json")) { console.log("::warning::osv-scanner produced no report"); process.exit(0); }
+            if (!fs.existsSync("osv.json")) { console.log("::error::osv-scanner produced no report"); process.exit(1); }
             const report = JSON.parse(fs.readFileSync("osv.json", "utf8"));
             const critical = [];
             for (const r of report.results ?? [])
