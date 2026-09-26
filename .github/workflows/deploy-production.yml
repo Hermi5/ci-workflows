@@ -75,6 +75,22 @@ on:
       CF_ACCESS_CLIENT_SECRET:
         description: Access service token secret for the smoke request
         required: false
+      # The production credentials live only in the caller repository's
+      # `production` environment, which the release job enters. A called
+      # workflow reads a secret only under a name declared here; for a
+      # declared name, the environment's value wins over anything the caller
+      # passes (GitHub, "Reuse workflows"). Undeclared, they arrived empty and
+      # the v0.2.0 release of sak-portal stopped at the snapshot (2026-09-26).
+      # The caller passes none of these three.
+      DATABASE_URL_PRODUCTION:
+        description: Production database URL (libpq form), from the production environment
+        required: false
+      CLOUDFLARE_API_TOKEN:
+        description: Cloudflare API token for the upload and the promote, from the production environment
+        required: false
+      CLOUDFLARE_ACCOUNT_ID:
+        description: Cloudflare account id, from the production environment
+        required: false
 
 permissions:
   contents: read
