@@ -8,6 +8,12 @@ name: deploy-production
 # the job is one serialized sequence: snapshot, migrate, upload without traffic,
 # smoke, promote.
 #
+# THE SNAPSHOT IS ENCRYPTED. A pg_dump holds every row, sessions included, and
+# a workflow artifact can be downloaded by anyone with read access to the repo
+# for 30 days. So the dump is encrypted to the caller's age public key before it
+# is uploaded, and only the `.dump.age` file leaves the runner. The private key
+# never touches GitHub: whoever restores holds it (`age -d -i <key>`).
+#
 # Production secrets belong only to the production environment. A tag must pass
 # read-only exact-commit/main acceptance before that environment is entered.
 # Owner and agent credentials still need distinct authority: this source check
@@ -51,6 +57,15 @@ on:
         type: string
         required: false
         default: "18"
+      snapshot-age-recipient:
+        description: >-
+          age X25519 public key (age1...) the pg_dump snapshot is encrypted to
+          before upload. Required when has-db is true: a release refuses to
+          upload an unencrypted dump. Only the holder of the matching private
+          key can restore it.
+        type: string
+        required: false
+        default: ""
       environment:
         description: "GitHub environment holding production secrets and tag restrictions"
         type: string
@@ -178,22 +193,54 @@ jobs:
         env:
           DATABASE_URL_PRODUCTION: ${{ secrets.DATABASE_URL_PRODUCTION }}
           PG_MAJOR: ${{ inputs.pg-major }}
+          AGE_RECIPIENT: ${{ inputs.snapshot-age-recipient }}
         run: |
           set -euo pipefail
           if [ -z "${DATABASE_URL_PRODUCTION:-}" ]; then
             echo "::error::has-db is true but DATABASE_URL_PRODUCTION is not set"
             exit 1
           fi
+          # Checked before the dump is taken, so a missing key stops the release
+          # before any production data sits on the runner.
+          if [ -z "${AGE_RECIPIENT:-}" ]; then
+            echo "::error::has-db is true but snapshot-age-recipient is not set; a snapshot is never uploaded unencrypted"
+            exit 1
+          fi
           "/usr/lib/postgresql/${PG_MAJOR}/bin/pg_dump" --no-owner --no-acl --format=custom \
             --file="snapshot-${GITHUB_REF_NAME}.dump" "$DATABASE_URL_PRODUCTION"
           ls -lh "snapshot-${GITHUB_REF_NAME}.dump"
+
+      # The PGDG step above already ran `apt-get update`.
+      - name: Install age
+        if: inputs.has-db
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y -qq age
+          age --version
+
+      # Encrypt, then delete the plaintext, so the upload below can only find
+      # the `.age` file.
+      - name: Encrypt the snapshot
+        if: inputs.has-db
+        env:
+          AGE_RECIPIENT: ${{ inputs.snapshot-age-recipient }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$AGE_RECIPIENT" =~ ^age1[02-9ac-hj-np-z]{58}$ ]]; then
+            echo "::error::snapshot-age-recipient is not an age X25519 public key (age1 followed by 58 characters)"
+            exit 1
+          fi
+          dump="snapshot-${GITHUB_REF_NAME}.dump"
+          age --encrypt --recipient "$AGE_RECIPIENT" --output "$dump.age" "$dump"
+          rm -f "$dump"
+          ls -lh "$dump.age"
 
       - name: Upload the snapshot
         if: inputs.has-db
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: db-snapshot-${{ github.ref_name }}
-          path: snapshot-*.dump
+          path: snapshot-*.dump.age
           retention-days: 30
           if-no-files-found: error
 
