@@ -160,10 +160,20 @@ the matrix column in a comment above it, so the ratchet is one line to delete.
 
 ### Flake policy
 
-`retries: 1` on CI only, `fullyParallel`, `trace: 'on-first-retry'`. **A spec
+`retries: 1` on CI only, `fullyParallel`. **A spec
 that retries twice in one week is quarantined** into a `@flaky` project that runs
 non-blocking, with a dated TODO next to it. No blanket retries, and no `retry: 3`
 to make a red suite go away; that converts a real bug into an intermittent one.
+
+Authenticated suites must disable Playwright tracing. This workflow does not
+upload Playwright HTML reports or test results: traces and API transport errors
+can retain Access headers, passwords, and session cookies. Reintroducing report
+uploads requires tested credential redaction. Both Playwright projects capture
+raw JSON and stderr in private temporary files outside the checkout, then remove
+them. CI receives only counts, failed test titles and source locations, and fixed
+error categories. A failed command or invalid report still fails the gate. This
+does not redact standard Playwright reports or arbitrary caller commands.
+Lighthouse reports are retained only when Lighthouse is enabled.
 
 ## Pinning
 
