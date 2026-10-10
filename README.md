@@ -64,11 +64,21 @@ jobs:
     with:
       ci-ref: <reviewed-commit-sha>
       has-db: true
+      # Public key only; the private key stays with whoever restores.
+      snapshot-age-recipient: age1...
       smoke-marker: "<html"
     secrets:
       CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
       CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
 ```
+
+With `has-db: true` the release takes a `pg_dump` before migrating and keeps it
+30 days as the artifact `db-snapshot-<tag>`. It is encrypted to
+`snapshot-age-recipient` first, and a release without that key stops before
+the dump. Restore: `gh run download <run> -n db-snapshot-<tag>`, then
+`age -d -i <private key> -o snapshot.dump snapshot-<tag>.dump.age`, then
+`pg_restore`. Generate the pair once with `age-keygen -o <file>` and keep the
+private key out of GitHub; losing it makes every snapshot unreadable.
 
 PR test credentials are passed by name. Production `CLOUDFLARE_API_TOKEN`,
 `CLOUDFLARE_ACCOUNT_ID`, and `DATABASE_URL_PRODUCTION` belong only to the
