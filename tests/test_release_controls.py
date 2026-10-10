@@ -42,6 +42,24 @@ curl() {
 }
 '''
 
+# Stands in for age: the "ciphertext" is the input behind an AGE: prefix.
+AGE = r'''
+age() {
+  local out='' in=''
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --encrypt) ;;
+      --recipient) shift ;;
+      --output) shift; out="$1" ;;
+      *) in="$1" ;;
+    esac
+    shift
+  done
+  { printf 'AGE:'; cat "$in"; } > "$out"
+}
+'''
+RECIPIENT = 'age1' + 'q' * 58
+
 
 class ShellControls(unittest.TestCase):
     def run_shell(self, body, values=None, files=None, prefix=''):
@@ -128,6 +146,32 @@ class ShellControls(unittest.TestCase):
     def test_failed_opennext_upload_stops_pipeline(self):
         result = self.run_shell(script(DEPLOY, 'Upload the version'), {'GITHUB_REF_NAME': 'v-test'}, prefix='npx() { return 1; }')
         self.assertNotEqual(result.returncode, 0)
+
+    def encrypt(self, recipient):
+        body = script(DEPLOY, 'Encrypt the snapshot') + '\necho FILES; ls -1; head -c 4 snapshot-v-test.dump.age'
+        return self.run_shell(body, {'AGE_RECIPIENT': recipient, 'GITHUB_REF_NAME': 'v-test'},
+                              {'snapshot-v-test.dump': 'rows'}, prefix=AGE)
+
+    def test_snapshot_leaves_the_runner_only_encrypted(self):
+        result = self.encrypt(RECIPIENT)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        files = result.stdout.split('FILES\n', 1)[1]
+        self.assertIn('snapshot-v-test.dump.age\n', files)
+        self.assertNotIn('snapshot-v-test.dump\n', files)
+        self.assertTrue(files.endswith('AGE:'))
+        for bad in ['', 'age1short', 'AGE1' + 'Q' * 58, 'age1' + 'b' * 58, 'ssh-ed25519 AAAA']:
+            self.assertNotEqual(self.encrypt(bad).returncode, 0, bad)
+
+    def test_snapshot_needs_a_key_and_uploads_only_the_encrypted_file(self):
+        text = DEPLOY.read_text()
+        order = [text.index('- name: ' + step) for step in
+                 ['Snapshot the production database', 'Encrypt the snapshot', 'Upload the snapshot', 'Migrate']]
+        self.assertEqual(order, sorted(order))
+        self.assertIn('path: snapshot-*.dump.age\n', text)
+        result = self.run_shell(script(DEPLOY, 'Snapshot the production database'), {
+            'DATABASE_URL_PRODUCTION': 'postgres://example', 'AGE_RECIPIENT': '', 'PG_MAJOR': '18'})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('snapshot-age-recipient', result.stdout)
 
     def test_production_authority_is_absent_from_pr_contract(self):
         self.assertNotIn('CLOUDFLARE_API_TOKEN', WEB.read_text())
